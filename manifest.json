@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hal68000.dashboard",
+  "name": "System Dashboard",
+  "version": "1.0.0",
+  "author": "Snow Oberon",
+  "license": "MIT",
+  "description": "Live system monitoring: CPU, RAM, GPU, disks, network, processes and services, with optional Home Assistant and phone integration.",
+  "kinds": [
+    "bar-widget",
+    "panel"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml",
+    "panel": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Dashboard",
+    "category": "system",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

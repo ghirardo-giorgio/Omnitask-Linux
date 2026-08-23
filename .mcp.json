@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "quickshell-dashboard": {
+      "command": "python3",
+      "args": ["scripts/dashboard_mcp.py"]
+    }
+  }
+}

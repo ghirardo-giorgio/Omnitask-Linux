@@ -1,0 +1,24 @@
+# Lettura della tabella DMI per il pannello Hardware (vedi memory() in
+# scripts/hardware.py).
+#
+# Installazione, da fare a mano una volta sola:
+#
+#   sudo install -m 0440 -o root -g root \
+#     scripts/quickshell-hardware.sudoers /etc/sudoers.d/quickshell-hardware
+#   sudo visudo -c
+#
+# Finche' non e' installato il pannello funziona lo stesso: mostra il totale
+# della RAM (che si legge da /proc/meminfo) e questo comando al posto di marca,
+# velocita' e occupazione degli slot.
+#
+# Serve perche' marca, modello e frequenza dei banchi stanno solo nella tabella
+# SMBIOS, che il kernel espone in /sys/firmware/dmi/tables con permessi 0400 e
+# nessun ripiego: non c'e' altro posto da cui leggerli.
+#
+# -t 16 e' l'array di memoria (quanti slot ha la scheda), -t 17 sono i banchi.
+# Nessuno dei due stampa numeri di serie della macchina, e dmidecode non ha
+# modo di scrivere niente. I due percorsi sono lo stesso file: su Fedora
+# /usr/sbin e' un link a /usr/bin, ma sudo confronta il percorso com'e' scritto.
+
+oberon ALL=(root) NOPASSWD: /usr/bin/dmidecode -t 16 -t 17, \
+                            /usr/sbin/dmidecode -t 16 -t 17

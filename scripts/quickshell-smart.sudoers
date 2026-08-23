@@ -1,0 +1,25 @@
+# Lettura dei dati SMART per la dashboard Quickshell (vedi smart_query in
+# scripts/sysmon.py).
+#
+# Installazione, da fare a mano una volta sola:
+#
+#   sudo install -m 0440 -o root -g root \
+#     scripts/quickshell-smart.sudoers /etc/sudoers.d/quickshell-smart
+#   sudo visudo -c
+#
+# Finche' non e' installato la dashboard funziona lo stesso: il pannello Dischi
+# mostra questo comando al posto dei dati di salute.
+#
+# Gli argomenti sono scritti per esteso e le uniche parti variabili sono classi
+# di caratteri: senza jolly non c'e' modo di far eseguire a smartctl qualcosa di
+# diverso da queste due letture. -A stampa gli attributi, -H lo stato di salute,
+# -j li mette in JSON; nessuna delle tre tocca il disco.
+#
+# I due percorsi sono lo stesso file: su Fedora /usr/sbin e' un link a /usr/bin,
+# ma sudo confronta il percorso cosi' com'e' scritto, e sysmon usa quello che
+# gli restituisce shutil.which.
+
+oberon ALL=(root) NOPASSWD: /usr/bin/smartctl -j -A -H /dev/nvme[0-9]n[0-9], \
+                            /usr/bin/smartctl -j -A -H /dev/sd[a-z], \
+                            /usr/sbin/smartctl -j -A -H /dev/nvme[0-9]n[0-9], \
+                            /usr/sbin/smartctl -j -A -H /dev/sd[a-z]

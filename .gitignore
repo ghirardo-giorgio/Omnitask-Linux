@@ -1,0 +1,18 @@
+# Bytecode Python degli script in scripts/
+__pycache__/
+*.py[cod]
+
+# Impostazioni locali di Claude Code: contengono percorsi della macchina
+.claude/settings.local.json
+
+# La configurazione dell'utente vive in ~/.config/quickshell/, non qui:
+# dashboard.json e home-assistant.json (che contiene il token) non vanno
+# versionati nemmeno se una prova li lascia nella cartella del progetto.
+dashboard.json
+home-assistant.json
+
+# Scarti di lavorazione
+*.log
+*.bak
+*.orig
+*~
