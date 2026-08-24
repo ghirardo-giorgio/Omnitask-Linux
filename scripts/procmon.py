@@ -21,12 +21,15 @@ import json
 import os
 import pwd
 import re
-import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+
+# I percorsi scritti in ~/.config/quickshell/tools.json vincono sul PATH:
+# vedi tools.py, che sta qui accanto.
+import tools
 
 PROC = "/proc"
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
@@ -58,7 +61,7 @@ CONN_FIX = "sudo setcap cap_dac_read_search,cap_sys_ptrace+ep $(which ss)"
 
 # pid -> [byte inviati/s, byte ricevuti/s], riempita dal thread di nethogs
 _net = {}
-_net_error = NET_HELP if shutil.which("nethogs") else "nethogs non installato"
+_net_error = NET_HELP if tools.which("nethogs") else "nethogs non installato"
 _net_lock = threading.Lock()
 
 # --- carico sulla GPU, per processo ------------------------------------------
@@ -77,7 +80,7 @@ try:
     GPU = pynvml.nvmlDeviceGetHandleByIndex(0)
     GPU_BACKEND = "nvml"
 except Exception:
-    if shutil.which("nvidia-smi"):
+    if tools.which("nvidia-smi"):
         GPU_BACKEND = "pmon"
 
 _gpu_error = "" if GPU_BACKEND else (
@@ -607,7 +610,7 @@ def nethogs_worker():
     non mostrarle."""
     global _net_error
 
-    binary = shutil.which("nethogs")
+    binary = tools.which("nethogs")
     if not binary:
         return
     try:

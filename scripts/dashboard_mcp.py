@@ -150,6 +150,67 @@ def services(scope="all", state="", query=""):
     }
 
 
+# Perche' un'unita' sta come sta, detto in inglese. I codici arrivano da
+# services.py: il collector non scrive frasi, per la stessa ragione per cui non
+# le scrive kdeconnect.py — la stessa risposta serve questo server in inglese e
+# il pannello nella lingua scelta dall'utente.
+CAUSES = {
+    "exit-code": "the program ran and exited with a non-zero status — the reason is in what it printed, not in systemd",
+    "signal": "the program was killed by a signal rather than exiting on its own",
+    "core-dump": "the program crashed and dumped core (coredumpctl has the dump)",
+    "timeout": "systemd gave up waiting: the unit passed a start, stop or runtime time limit",
+    "watchdog": "the program stopped pinging systemd's watchdog",
+    "start-limit-hit": "restarted too often too quickly, so systemd stopped trying — it needs `systemctl reset-failed` before it will start again",
+    "oom-kill": "the kernel killed it to reclaim memory",
+    "resources": "systemd could not set the unit up — a missing binary, a user or a namespace it could not create",
+    "exec-condition": "the ExecCondition command said not to run",
+    "protocol": "the unit did not speak the protocol its Type= promised, e.g. a notify service that never notified",
+    "condition": "a Condition… in the unit file was not met, so it was skipped rather than started — this is not a failure",
+    "assert": "an Assert… in the unit file was not met, which systemd treats as a failure",
+    "not-found": "no such unit in that systemd",
+    "running": "it is running",
+    "stopped": "it is stopped, and stopped cleanly",
+    "success": "the last run ended cleanly",
+    "unknown": "systemd recorded no reason",
+}
+
+
+def diagnose(unit="", scope="all", lines=0):
+    """Why units are in the state they are in, with the journal to prove it."""
+    argv = ["python3", SERVICES, "diagnose"]
+
+    if unit:
+        argv.append(unit)
+
+    if scope in ("user", "system"):
+        argv += ["--scope", scope]
+
+    if lines:
+        argv += ["--lines", str(lines)]
+
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+        data = json.loads(done.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return {"ok": False, "error": f"could not diagnose: {exc}"}
+
+    if not data.get("ok"):
+        return data
+
+    for row in data.get("units", []):
+        row["explanation"] = CAUSES.get(row.get("cause", ""), "")
+
+    return {
+        "ok": True,
+        "units": data.get("units", []),
+        "note": data.get("note", "") or (
+            "Read live from systemctl and the journal. Nothing here has been "
+            "changed: starting, stopping and resetting units is the person's "
+            "to do."
+        ),
+    }
+
+
 # ---------------------------------------------------------------- hardware
 
 
@@ -403,7 +464,17 @@ TOOLS = [
         "name": "services",
         "description": (
             "systemd units on this machine: what is running, what failed, what "
-            "starts at boot. Covers both the user session and the system."
+            "starts at boot. Covers both the user session and the system. "
+            "Set diagnose=true to be told *why* instead of *what*: it answers "
+            "'why did X fail?' and 'what are those failed services about?' with "
+            "systemd's own verdict on the unit (exit code or the signal that "
+            "killed it, whether it timed out, dumped core, hit the restart "
+            "limit, or never started because a condition was not met), the "
+            "command it ran, the unit file it came from, and the last lines that "
+            "unit wrote to the journal. Without a unit name it diagnoses every "
+            "currently failed unit at once, which is the usual question. This "
+            "reads; it never starts, stops or resets anything — say what you "
+            "found and let the person act on it."
         ),
         "inputSchema": {
             "type": "object",
@@ -411,6 +482,31 @@ TOOLS = [
                 "scope": {"type": "string", "enum": ["user", "system", "all"], "description": "Default 'all'."},
                 "state": {"type": "string", "description": "Only units in this state, e.g. 'active' or 'failed'."},
                 "query": {"type": "string", "description": "Match against unit name or description."},
+                "diagnose": {
+                    "type": "boolean",
+                    "description": (
+                        "Explain why units are in the state they are in, "
+                        "instead of listing them. With no unit given, every "
+                        "unit that is failed right now."
+                    ),
+                },
+                "unit": {
+                    "type": "string",
+                    "description": (
+                        "diagnose only: the exact unit name, e.g. "
+                        "'sshd.service'. A name that exists in both systemds is "
+                        "reported for both."
+                    ),
+                },
+                "lines": {
+                    "type": "integer",
+                    "description": (
+                        "diagnose only: how many journal entries per unit "
+                        "(default 40 for one unit, a third of that when "
+                        "diagnosing them all; each entry is one line here, "
+                        "trimmed)."
+                    ),
+                },
             },
         },
     },
@@ -472,24 +568,60 @@ TOOLS = [
             "properties": {
                 "section": {
                     "type": "string",
-                    "enum": ["status", "apps", "screen", "camera"],
+                    "enum": [
+                        "status", "apps", "screen", "pointer", "camera",
+                        "heart", "today", "vitals",
+                    ],
                     "description": (
                         "status (default): every known phone and its ADB state. "
                         "apps: installed packages on one connected phone. "
-                        "screen: every label on the screen right now, each with "
-                        "the pixel to tap for it — read this before tapping "
+                        "screen: every label on the screen right now, each "
+                        "with its class, whether it can be tapped, and the "
+                        "pixel to tap for it — read this before tapping "
                         "anything, and again afterwards to see what changed. "
+                        "It reads the accessibility tree, so it needs the "
+                        "screen to be ON: on a sleeping phone it says so, and "
+                        "phone_control display=on (or unlock, if there is a "
+                        "PIN) is what fixes it. Games, canvases and apps drawn "
+                        "by hand expose no labels at all — there take a "
+                        "screenshot instead, no ADB call can invent them. "
+                        "pointer: where the mouse cursor sits right now, in "
+                        "screen pixels, ready to hand straight to "
+                        "phone_control tap. It needs a mouse on the phone: a "
+                        "real one over USB or Bluetooth, or the fake HID one "
+                        "that mirror gives it. A finger leaves no coordinates "
+                        "at all — Android forgets a touch the moment it ends — "
+                        "so this answers 'where did I leave the cursor', never "
+                        "'where did the user last tap'. "
                         "camera: the lenses this phone has, with focal length "
                         "and closest focus distance, and which of them look "
                         "like a dedicated macro module. Read-only and works "
-                        "even without the camera app installed."
+                        "even without the camera app installed. "
+                        "heart: heart rate over the last `minutes`, one point "
+                        "per minute with avg/min/max, gaps left as null. "
+                        "today: steps, calories, distance, sleep, skin "
+                        "temperature and weight for today. "
+                        "vitals: what Health Connect holds and how fresh each "
+                        "type is — the section to read when a number looks "
+                        "wrong, because it says who wrote the data. "
+                        "These last three need the HealthBridge app on the "
+                        "phone and take about 6 seconds each. THE DELAY "
+                        "MATTERS: the Fitbit app copies into Health Connect in "
+                        "batches, so the newest heart sample is typically "
+                        "20-30 MINUTES OLD. Always read `lag_seconds` and say "
+                        "how old the reading is — never present it as the "
+                        "current heart rate. Data Fitbit does not write at all "
+                        "(HRV, SpO2, resting heart rate) comes back null."
                     ),
                 },
                 "device": {
                     "type": "string",
                     "description": (
                         "Which phone: part of its name ('moto g24'), its IP, or "
-                        "its ADB serial. Optional when only one is connected."
+                        "its ADB serial. Optional when only one is connected — "
+                        "with several, every section but status refuses to "
+                        "guess and lists the names to choose from. A phone on "
+                        "the cable and on wi-fi at once counts as one, not two."
                     ),
                 },
                 "query": {
@@ -497,6 +629,14 @@ TOOLS = [
                     "description": (
                         "apps: filter the package list, e.g. 'whatsapp'. "
                         "screen: keep only labels containing this."
+                    ),
+                },
+                "minutes": {
+                    "type": "integer",
+                    "description": (
+                        "heart only: how far back to look, in minutes "
+                        "(default 60). Given the batching delay, less than 60 "
+                        "often comes back all gaps."
                     ),
                 },
                 "system": {
@@ -523,9 +663,24 @@ TOOLS = [
             "or ask the person to frame it themselves with aim. "
             "The user authorises every phone on the handset itself — an RSA "
             "key prompt over USB, a six-digit code for wireless debugging — "
-            "and this cannot bypass that. Pairing needs the code the phone is "
-            "showing at that moment: ask the user to read it out, the port is "
-            "found over mDNS. Prefer tap_text over tap: it looks the label up "
+            "and this cannot bypass that. Pairing is done once and stays done: "
+            "the port that worked is remembered, so a later connect usually "
+            "needs no code and no mDNS. Only pair when the phone has never been "
+            "paired with this machine, and it needs the code the phone is "
+            "showing at that moment: ask the user to read it out. repair is for "
+            "the opposite case, a phone that dropped an authorisation it once "
+            "gave: it tells apart the revoked USB key (it makes the RSA prompt "
+            "come back) from a wireless pairing the phone forgot (it clears the "
+            "stale 'already paired' bookkeeping, and then pair with a fresh code "
+            "is the way back in). forget drops "
+            "the remembered port, for when the phone or the network changed. "
+            "mirror opens scrcpy in a window on this machine — real-time screen "
+            "and two-finger gestures, which ADB alone cannot do; it is for the "
+            "person at the keyboard, not a way for you to see the screen (use "
+            "screenshot or phone_adb section=screen for that). It gives the "
+            "phone a fake HID mouse, so once the person has moved it inside "
+            "that window phone_adb section=pointer can read the cursor back. "
+            "Prefer tap_text over tap: it looks the label up "
             "in the accessibility tree and hits the button that contains it, "
             "which is what the user means by 'press Salute'. It fails rather "
             "than guessing when the label is not on screen or appears more "
@@ -539,7 +694,8 @@ TOOLS = [
                 "action": {
                     "type": "string",
                     "enum": [
-                        "connect", "pair", "disconnect", "launch", "open",
+                        "connect", "pair", "repair", "disconnect", "forget", "mirror",
+                        "launch", "open",
                         "tap_text", "tap", "swipe", "text", "key", "screenshot",
                         "photo", "aim",
                     ],
@@ -693,7 +849,19 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "metric": {"type": "string", "enum": ["cpu", "memory", "gpu", "network_in", "network_out"]},
+                "metric": {
+                    "type": "string",
+                    "enum": [
+                        "cpu", "memory", "gpu", "network_in", "network_out",
+                        "heart_rate",
+                    ],
+                    "description": (
+                        "heart_rate needs the Battito panel switched on, and "
+                        "reports `gaps` — minutes the wristband sent nothing. "
+                        "For a one-off reading that works without the panel, "
+                        "use phone_adb section=heart instead."
+                    ),
+                },
             },
             "required": ["metric"],
         },
@@ -722,6 +890,13 @@ TOOLS = [
 
 def call_tool(name, args):
     if name == "services":
+        if args.get("diagnose") or args.get("unit"):
+            return diagnose(
+                unit=args.get("unit", ""),
+                scope=args.get("scope", "all"),
+                lines=args.get("lines", 0),
+            )
+
         return services(
             scope=args.get("scope", "all"),
             state=args.get("state", ""),
@@ -738,10 +913,18 @@ def call_tool(name, args):
         if args.get("device"):
             argv += ["--device", args["device"]]
 
-        argv.append(section if section in ("apps", "screen", "camera") else "status")
+        argv.append(
+            section if section in (
+                "apps", "screen", "pointer", "camera", "heart", "today", "vitals",
+            )
+            else "status"
+        )
 
         if section in ("apps", "screen") and args.get("query"):
             argv += ["--query", args["query"]]
+
+        if section == "heart" and args.get("minutes"):
+            argv += ["--minutes", str(args["minutes"])]
 
         if section == "apps" and args.get("system"):
             argv.append("--system")
@@ -807,7 +990,7 @@ def call_tool(name, args):
                 argv.append("--full")
         elif action == "aim":
             argv += ["aim", "--mode", args.get("mode", "macro")]
-        elif action in ("connect", "disconnect"):
+        elif action in ("connect", "repair", "disconnect", "forget", "mirror"):
             argv.append(action)
         else:
             return {"ok": False, "error": f"unknown action: {action}"}

@@ -38,15 +38,53 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from datetime import date, datetime, timedelta
 
 import phone_adb
 
 HA_CONFIG = os.path.expanduser("~/.config/quickshell/home-assistant.json")
 
-# Lo stesso rettangolo a ogni scatto: e' quello che rende confrontabili due
-# letture a ore di distanza, e senza il telefono inquadra la scrivania.
+# Il rettangolo da leggere non si impone a ogni scatto: lo tiene il telefono.
+#
+# Imporlo e' quello che si faceva prima, e aveva un difetto che si vedeva solo
+# usandolo: chi sposta il tester o il telefono riquadra l'area col mirino
+# (`phone_adb.py aim`), l'app se la salva, e dieci minuti dopo il timer
+# rimetteva quella scritta qui — cioe' il lavoro appena fatto spariva senza
+# dire niente. Adesso lo scatto parte senza rettangolo, l'app usa il suo, e
+# quello che ha usato si registra qui sotto.
+#
+# Questo resta come seme: serve la primissima volta, o se all'app venissero
+# cancellati i dati e si ritrovasse senza. Non e' piu' l'ultima parola.
 DEFAULT_ROI = "0.23148148,0.446875,0.71481484,0.6856771"
 DEFAULT_DEVICE = "OPG02_jp_kdi"
+
+# Dove si tiene il conto della giornata: il contatore del tester a inizio
+# giornata, e l'ultimo letto.
+#
+# Il tester conta da quando e' stato acceso l'ultima volta — 56 mila mAh e
+# passa — e quel numero non risponde alla domanda che ci si fa guardando il
+# grafico, che e' "quanto ha raccolto oggi". La differenza col valore di
+# stamattina invece si', ed e' quella che si pubblica.
+#
+# Un appunto locale e non un'attributo in Home Assistant: le entita' create da
+# /api/states spariscono a ogni riavvio di Home Assistant, e perdere l'inizio
+# giornata a meta' pomeriggio vorrebbe dire ripartire da zero buttando via le
+# ore di sole gia' raccolte.
+DAY_RECORD = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "quickshell",
+    "solar-day.json",
+)
+
+# Dove si registra il rettangolo che il telefono sta usando davvero. E' un
+# appunto, non una configurazione: la verita' e' sul telefono, e se il file
+# sparisce si perde solo la rete di sicurezza per quando l'app non ce l'ha
+# piu'.
+ROI_RECORD = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "quickshell",
+    "solar-roi.json",
+)
 
 # Quanto puo' sbagliare l'OCR prima che la lettura sia da buttare. La potenza
 # e' stretta perche' il tester la calcola lui dalle altre due e quindi torna
@@ -73,7 +111,11 @@ SENSORS = {
     "corrente": ("A", "current", "measurement"),
     "potenza": ("W", "power", "measurement"),
     "energia": ("Wh", "energy", "total_increasing"),
-    "carica": ("mAh", None, "total_increasing"),
+    # `total` e non `total_increasing`: quello che si pubblica e' la raccolta
+    # di oggi, che a mezzanotte torna a zero, e un `total_increasing` che
+    # scende verrebbe letto come un contatore ripartito — cioe' come un'altra
+    # giornata intera da sommare.
+    "carica": ("mAh", None, "total"),
     "temperatura": ("°C", "temperature", "measurement"),
 }
 
@@ -156,8 +198,18 @@ def publish(reading, sky, dry_run=False, dark=False):
         if value is None:
             continue
 
+        # La carica esce come raccolta di oggi, non come contatore del tester:
+        # 56 mila mAh non rispondono a "quanto ha raccolto stamattina", e la
+        # differenza col valore di inizio giornata si'. Il numero del tester
+        # resta fra gli attributi, che e' dove serve — a controllare che il
+        # conto torni, non a guardarlo su un grafico.
+        started = None
+
+        if name == "carica":
+            value, started = daily_charge(value, persist=not dry_run)
+
         attributes = {
-            "friendly_name": "Solare USB " + name,
+            "friendly_name": "Solare " + name,
             "unit_of_measurement": unit,
             "state_class": state_class,
             # L'elevazione viaggia con ogni campione perche' e' l'unica cosa
@@ -175,6 +227,14 @@ def publish(reading, sky, dry_run=False, dark=False):
 
         if device_class:
             attributes["device_class"] = device_class
+
+        if started is not None:
+            attributes["totale_tester"] = round(reading[name], 4)
+            attributes["inizio_giornata"] = round(started, 4)
+            # Un `total` senza `last_reset` e' un totale che Home Assistant non
+            # sa quando ricomincia, e a mezzanotte vedrebbe un salto all'ingiu'
+            # invece di una giornata nuova.
+            attributes["last_reset"] = midnight()
 
         payload = {"state": round(value, 4), "attributes": attributes}
         entity = PREFIX + name
@@ -214,13 +274,104 @@ def count_discard(reason, dry_run=False):
         ha_call("/api/states/" + entity, {
             "state": total + 1,
             "attributes": {
-                "friendly_name": "Solare USB letture scartate",
+                "friendly_name": "Solare letture scartate",
                 "state_class": "total_increasing",
                 "last_reason": reason,
             },
         })
     except (urllib.error.URLError, OSError, ValueError):
         pass
+
+
+def load_day():
+    """L'appunto della giornata, o {} se non c'e' o non si legge."""
+    try:
+        with open(DAY_RECORD, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def save_day(data):
+    """Scrive l'appunto, sostituendolo invece di riscriverlo sul posto."""
+    tmp = DAY_RECORD + ".tmp"
+
+    try:
+        os.makedirs(os.path.dirname(DAY_RECORD), exist_ok=True)
+
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+
+        os.replace(tmp, DAY_RECORD)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def daily_charge(raw, persist=True):
+    """I mAh raccolti da stamattina: il contatore di adesso meno quello di allora.
+
+    Torna (oggi, inizio). La prima lettura del giorno fissa l'inizio, e da li'
+    in poi ogni lettura e' una sottrazione — che e' esattamente la differenza
+    fra il valore di ieri sera e quello di adesso, visto che di notte il
+    pannello non produce e il contatore non si muove.
+
+    Il tester si puo' azzerare da solo (basta staccarlo e riattaccarlo) e allora
+    il contatore riparte da sotto: qui si riconosce dal fatto che scende, e
+    l'inizio si sposta li' invece di far comparire un numero negativo. Quello
+    che si perde in quel caso e' la raccolta prima dell'azzeramento, che il
+    tester non sa piu' nemmeno lui.
+    """
+    today = date.today()
+    day = load_day()
+
+    if day.get("giorno") != today.isoformat() or not isinstance(day.get("inizio"), (int, float)):
+        # Giornata nuova. L'inizio e' il contatore di ieri sera, non quello di
+        # adesso: fra l'ultima lettura di ieri e la prima di oggi il tester ha
+        # continuato a contare, e far ripartire il conto da adesso vorrebbe
+        # dire buttare via quei mAh invece di attribuirli a un giorno.
+        #
+        # Vale pero' solo se ieri si e' letto davvero: dopo una settimana di
+        # pioggia o di macchina spenta, l'ultimo valore e' di sette giorni fa,
+        # e usarlo come inizio farebbe comparire oggi una punta che e' la
+        # raccolta di tutta la settimana.
+        before = day.get("ultimo")
+        yesterday = day.get("giorno") == (today - timedelta(days=1)).isoformat()
+        start = before if (yesterday and isinstance(before, (int, float))) else raw
+
+        day = {"giorno": today.isoformat(), "inizio": float(start)}
+
+    if raw < day["inizio"]:
+        day["inizio"] = raw
+
+    day["ultimo"] = raw
+
+    if persist:
+        save_day(day)
+
+    return max(0.0, raw - day["inizio"]), day["inizio"]
+
+
+def held_charge():
+    """L'ultimo contatore del tester visto, o None.
+
+    Serve quando il display e' spento: la carica pubblicata e' quella di oggi,
+    e rileggerla da Home Assistant per ripubblicarla vorrebbe dire sottrarle
+    l'inizio giornata una seconda volta. Il contatore vero e' qui.
+    """
+    held = load_day().get("ultimo")
+
+    return float(held) if isinstance(held, (int, float)) else None
+
+
+def midnight():
+    """Mezzanotte di oggi, con il fuso: e' il `last_reset` della raccolta."""
+    return datetime.now().astimezone().replace(
+        hour=0, minute=0, second=0, microsecond=0).isoformat()
 
 
 def last_value(name):
@@ -472,12 +623,65 @@ def reconcile(found):
     return reading, quality
 
 
+def recorded_roi():
+    """Il rettangolo registrato l'ultima volta, o "" se non ce n'e' uno.
+
+    Un file illeggibile vale come un file assente: la lettura di adesso non
+    dipende da questo appunto, e farla fallire per un JSON troncato sarebbe
+    peggio del guasto che si vuole evitare.
+    """
+    try:
+        with open(ROI_RECORD, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return ""
+
+    roi = data.get("roi", "") if isinstance(data, dict) else ""
+
+    return roi if isinstance(roi, str) else ""
+
+
+def record_roi(roi):
+    """Segna il rettangolo che il telefono ha appena usato.
+
+    Si riscrive solo quando cambia: e' un file toccato ogni dieci minuti da un
+    timer, e riscriverlo identico a se stesso sarebbe usura senza motivo. Il
+    momento in cui cambia e' invece un'informazione — e' quando qualcuno ha
+    riquadrato col mirino — e vale la pena averla scritta.
+    """
+    if not roi or roi == recorded_roi():
+        return
+
+    tmp = ROI_RECORD + ".tmp"
+
+    try:
+        os.makedirs(os.path.dirname(ROI_RECORD), exist_ok=True)
+
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump({"roi": roi, "seen": time.strftime("%Y-%m-%d %H:%M:%S")},
+                      handle, ensure_ascii=False)
+
+        os.replace(tmp, ROI_RECORD)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
 def capture(device, roi, dry_run=False):
     """Uno scatto e la sua interpretazione, o il motivo per cui non si usa."""
     shot = phone_adb.do_photo(mode="macro", target=device, roi=roi, full=True)
 
     if not shot.get("ok"):
         return None, {"errore": shot.get("error", "scatto fallito")}
+
+    # Quello che il telefono ha davvero inquadrato, che con `roi` vuoto e' il
+    # rettangolo suo. Registrarlo qui vuol dire che una riquadratura fatta col
+    # mirino resta scritta anche da questa parte, senza doverla ricopiare a
+    # mano in nessun file.
+    used = shot.get("roi") or ""
+    record_roi(used)
 
     text = shot.get("text", "")
 
@@ -488,16 +692,19 @@ def capture(device, roi, dry_run=False):
     if len(text.strip()) < 8:
         return None, {"errore": "il display del tester e' spento o al buio",
                       "buio": True,
+                      "roi": used,
                       "immagine": shot.get("path", "")}
 
     found = parse(text)
     reading, quality = reconcile(found)
 
     if reading is None:
-        return None, {"errore": quality, "letto": found, "immagine": shot.get("path", "")}
+        return None, {"errore": quality, "letto": found, "roi": used,
+                      "immagine": shot.get("path", "")}
 
     reading["image"] = shot.get("path", "")
     quality["took_ms"] = shot.get("took_ms")
+    quality["roi"] = used
 
     return reading, quality
 
@@ -521,6 +728,14 @@ def measure(device, roi, dry_run=False, retries=1):
             return reading, quality
 
         problems.append(quality)
+
+        # Il telefono non ha nessun rettangolo: l'app e' stata reinstallata, o
+        # le hanno cancellato i dati. La prima foto ha inquadrato la scrivania,
+        # e senza rimediare il timer continuerebbe a fotografarla ogni dieci
+        # minuti. Il secondo tentativo glielo rimette — quello registrato, e
+        # solo in mancanza di quello il seme scritto qui dentro.
+        if not roi and quality.get("roi") == "":
+            roi = recorded_roi() or DEFAULT_ROI
 
     # Display spento a ogni tentativo: il tester non ha corrente, quindi non ne
     # passa nemmeno al carico. Zero e' la misura vera, e vale la pena
@@ -551,11 +766,21 @@ def measure(device, roi, dry_run=False, retries=1):
         # a zero, mentre i contatori tornerebbero solo alla prossima giornata
         # di sole — cioe' quando il valore di ieri non serve piu' a nessuno.
         if not dry_run:
-            for counter in ("energia", "carica"):
-                held = last_value(counter)
+            held = last_value("energia")
 
-                if held is not None:
-                    dark[counter] = held
+            if held is not None:
+                dark["energia"] = held
+
+        # La carica no: quella pubblicata e' la raccolta di oggi, e rileggerla
+        # da Home Assistant per riscriverla vorrebbe dire passarla di nuovo
+        # dalla sottrazione — cioe' toglierle l'inizio giornata due volte, e
+        # spostare l'inizio stesso su un numero che non e' un contatore. Il
+        # contatore del tester sta nell'appunto della giornata, e da li' si
+        # rilegge tale e quale.
+        held = held_charge()
+
+        if held is not None:
+            dark["carica"] = held
 
         return dark, {
             "fonte": "display spento",
@@ -623,7 +848,10 @@ def run(device, roi, dry_run=False, force=False, from_text="", min_elevation=MIN
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="quale telefono fotografa")
-    parser.add_argument("--roi", default=DEFAULT_ROI, help="il rettangolo da inquadrare")
+    parser.add_argument("--roi", default="",
+                        help="forza il rettangolo per questo scatto; vuoto = "
+                             "quello che ha il telefono (riquadralo col mirino: "
+                             "phone_adb.py aim)")
     parser.add_argument("--dry-run", action="store_true", help="legge e stampa, senza scrivere in HA")
     parser.add_argument("--force", action="store_true", help="scatta anche col sole basso")
     parser.add_argument("--from-text", default="", help="interpreta questo testo invece di scattare")

@@ -104,6 +104,15 @@ Item {
             host.show(phoneWin);
         }
 
+        // La riassociazione parte prima che la finestra si veda: cosi' chi
+        // guarda trova gia' le istruzioni invece di un riquadro vuoto che
+        // diventa istruzioni un attimo dopo.
+        function onRepairPhone(device: string): void {
+            phoneWin.open(device);
+            phoneWin.startRepair();
+            host.show(phoneWin);
+        }
+
         // La dashboard si toglie di mezzo mentre il comando IA preme i tasti;
         // si riapre con la scorciatoia (qs ipc call dashboard toggle).
         function onHideWindow(): void {

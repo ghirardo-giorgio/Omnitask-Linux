@@ -134,6 +134,19 @@ ShellRoot {
             return "aperta su " + device;
         }
 
+        // La stessa finestra, aperta gia' sulla riassociazione — per quando e'
+        // il telefono ad aver tolto l'autorizzazione:
+        //   qs ipc call dashboard repair "moto g24"
+        function repair(device: string): string {
+            if (device === "")
+                return "manca il nome del telefono";
+
+            host.phoneWindow.open(device);
+            host.phoneWindow.startRepair();
+            host.show(host.phoneWindow);
+            return "riassociazione di " + device;
+        }
+
         // Accende o spegne un pannello per id (gli stessi del catalogo di
         // Settings): comodo da legare a una scorciatoia, es.
         //   qs ipc call dashboard panel homeassistant

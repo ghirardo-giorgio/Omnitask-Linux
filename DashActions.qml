@@ -21,6 +21,10 @@ Singleton {
     // Quale telefono aprire: il nome di KDE Connect, che phone_adb.py sa
     // risolvere da solo in indirizzo o serial.
     signal openPhone(string device)
+    // Lo stesso telefono, ma aprendo la finestra gia' in riassociazione: e'
+    // dal pannello che ci si accorge che non risponde piu', ed e' li' che sta
+    // il pulsante.
+    signal repairPhone(string device)
     // Il comando IA la chiede prima di premere dei tasti: la finestra della
     // dashboard e' quella che li intercetterebbe.
     signal hideWindow

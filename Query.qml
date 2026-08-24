@@ -711,6 +711,15 @@ Singleton {
                 network_out: {
                     values: SystemStats.netTxHistory,
                     unit: "bytes_per_second"
+                },
+                heart_rate: {
+                    values: Fitbit.values,
+                    unit: "bpm",
+                    // Il battito non e' campionato come gli altri: un punto al
+                    // minuto invece che ogni `procInterval`, e con dei buchi
+                    // dove il braccialetto non ha mandato niente.
+                    intervalMs: 60000,
+                    gaps: true
                 }
             });
 
@@ -722,7 +731,14 @@ Singleton {
                 valid: Object.keys(series)
             };
 
-        const values = (found.values ?? []).slice();
+        // I buchi si tolgono prima di contare: un `null` sommato diventa zero,
+        // e un minuto senza dati abbasserebbe la media come se il cuore si
+        // fosse fermato. Quanti erano pero' si dice, perche' e' un fatto vero
+        // — «il braccialetto era via per venti minuti» — e non un dettaglio.
+        const raw = (found.values ?? []).slice();
+        const values = found.gaps ? raw.filter(v => v !== null && isFinite(v)) : raw;
+        const gaps = raw.length - values.length;
+
         if (values.length === 0)
             return {
                 ok: false,
@@ -752,7 +768,8 @@ Singleton {
             metric: metric,
             unit: found.unit,
             samples: values.length,
-            covers_seconds: Math.round(values.length * Settings.procInterval / 1000),
+            covers_seconds: Math.round(raw.length * (found.intervalMs ?? Settings.procInterval) / 1000),
+            gaps: gaps,
             latest: values[values.length - 1],
             minimum: min,
             maximum: max,

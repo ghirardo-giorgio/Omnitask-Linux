@@ -116,6 +116,11 @@ Singleton {
             file: "PhonePanel"
         },
         {
+            id: "heart",
+            title: I18n.t("Battito"),
+            file: "HeartPanel"
+        },
+        {
             id: "tools",
             title: I18n.t("Servizi e processi"),
             file: "ToolsPanel"
@@ -138,6 +143,8 @@ Singleton {
     readonly property int sampleInterval: cfg.sampleInterval
     readonly property int haPollInterval: cfg.haPollInterval
     readonly property int procInterval: cfg.procInterval
+    readonly property string heartDevice: cfg.heartDevice
+    readonly property int heartWindowHours: cfg.heartWindowHours
     readonly property string language: cfg.language
     readonly property var disks: cfg.disks
     readonly property var sensors: cfg.sensors
@@ -150,6 +157,13 @@ Singleton {
 
     function setLanguage(code: string) {
         cfg.language = code;
+        configFile.writeAdapter();
+    }
+
+    // Il telefono che ha il braccialetto al polso. Vuoto vuol dire "quello che
+    // c'e'", e va bene finche' ne e' collegato uno solo: vedi heartDevice.
+    function setHeartDevice(name: string) {
+        cfg.heartDevice = name;
         configFile.writeAdapter();
     }
 
@@ -444,6 +458,7 @@ Singleton {
             historyHours: [1, 48],
             sampleInterval: [500, 10000],
             haPollInterval: [1000, 300000],
+            heartWindowHours: [1, 24],
             procInterval: [1000, 10000]
         })
 
@@ -491,6 +506,12 @@ Singleton {
             property int sampleInterval: 1000
             property int haPollInterval: 15000
             property int procInterval: 2000
+            // quale telefono ha il braccialetto al polso. Vuoto va bene finche'
+            // ne e' collegato uno solo: con due, `pick` si rifiuta di indovinare
+            // e ha ragione, ma un pannello che chiede il battito a un telefono
+            // che non ha mai visto un Fitbit sonderebbe per ore per niente.
+            property string heartDevice: ""
+            property int heartWindowHours: 2
             // lingua dell'interfaccia: vuoto = quella del sistema
             property string language: ""
             // filtri della finestra Rete, tenuti separati: nascondere il

@@ -36,13 +36,16 @@ winplace.py, dove bastava un apostrofo nel titolo di una finestra qualsiasi per
 far fallire in silenzio ogni lettura). busctl il JSON lo produce lui.
 """
 import json
-import shutil
 import subprocess
 import sys
 
+# I percorsi scritti in ~/.config/quickshell/tools.json vincono sul PATH:
+# vedi tools.py, che sta qui accanto.
+import tools
+
 TIMEOUT = 5
 
-BUSCTL = shutil.which("busctl")
+BUSCTL = tools.which("busctl")
 
 KDE = "org.kde.kdeconnect"
 KDE_DAEMON = "/modules/kdeconnect"

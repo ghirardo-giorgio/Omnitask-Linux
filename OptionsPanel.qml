@@ -2230,6 +2230,141 @@ Rectangle {
                 }
             }
 
+            // =================================================== battito
+
+            Text {
+                Layout.topMargin: 10
+
+                color: "#8b949e"
+                font.pixelSize: 10
+                font.letterSpacing: 1
+
+                text: I18n.t("BATTITO")
+            }
+
+            Text {
+                Layout.fillWidth: true
+
+                wrapMode: Text.Wrap
+                color: "#6e7681"
+                font.pixelSize: 10
+
+                text:
+                    I18n.t(
+                        "Quale telefono ha il braccialetto al polso. AUTO va bene finche' ne e' collegato uno solo: con due, il pannello non puo' indovinare quale, e lo dice invece di leggere il battito sbagliato."
+                    )
+            }
+
+            RowLayout {
+                id: heartPick
+
+                // AUTO, i telefoni che adb vede adesso, e — se non e' fra
+                // quelli — quello salvato. Senza l'ultimo pezzo la scelta
+                // scritta nel file sparirebbe dalla riga ogni volta che il
+                // telefono e' spento, e la riga direbbe AUTO: cioe' una scelta
+                // diversa da quella che vale davvero.
+                readonly property var options: {
+                    const out = [
+                        {
+                            code: "",
+                            label: I18n.t("AUTO")
+                        }
+                    ];
+
+                    for (const name of PhoneAdb.phones)
+                        out.push({
+                            code: name,
+                            label: name
+                        });
+
+                    if (Settings.heartDevice && !PhoneAdb.phones.includes(Settings.heartDevice))
+                        out.push({
+                            code: Settings.heartDevice,
+                            label: Settings.heartDevice
+                        });
+
+                    return out;
+                }
+
+                Layout.fillWidth: true
+
+                spacing: 4
+
+                // Una guardata a ogni apertura della finestra: un telefono
+                // acceso dopo l'ultima volta deve comparire da se'. Anche alla
+                // creazione, perche' la prima apertura non cambia `visible` —
+                // la riga nasce gia' visibile, e senza questa il primo giro
+                // mostrerebbe il solo AUTO.
+                Component.onCompleted: PhoneAdb.peek()
+
+                onVisibleChanged: {
+                    if (heartPick.visible)
+                        PhoneAdb.peek();
+                }
+
+                Repeater {
+                    model: heartPick.options
+
+                    Rectangle {
+                        id: phoneButton
+
+                        required property var modelData
+
+                        readonly property bool current:
+                            Settings.heartDevice
+                            === phoneButton.modelData.code
+
+                        Layout.fillWidth: true
+
+                        implicitHeight: 24
+                        radius: 4
+
+                        color:
+                            phoneButton.current
+                            ? "#21262d"
+                            : "transparent"
+
+                        border.width: 1
+
+                        border.color:
+                            phoneButton.current
+                            ? "#58a6ff"
+                            : "#30363d"
+
+                        Text {
+                            anchors.fill: parent
+                            anchors.margins: 4
+
+                            horizontalAlignment: Text.AlignHCenter
+                            verticalAlignment: Text.AlignVCenter
+                            elide: Text.ElideRight
+
+                            color:
+                                phoneButton.current
+                                ? "#58a6ff"
+                                : "#6e7681"
+
+                            font.pixelSize: 10
+
+                            text:
+                                phoneButton.modelData.label
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+
+                            cursorShape:
+                                Qt.PointingHandCursor
+
+                            onClicked:
+                                Settings.setHeartDevice(
+                                    phoneButton.modelData.code
+                                )
+                        }
+                    }
+                }
+            }
+
             // ================================================= priorità
 
             Text {
@@ -2485,6 +2620,14 @@ Rectangle {
                         ),
                         step: 500,
                         suffix: " ms"
+                    },
+                    {
+                        name: "heartWindowHours",
+                        label: I18n.t(
+                            "Ore di storico battito"
+                        ),
+                        step: 1,
+                        suffix: " h"
                     }
                 ]
 

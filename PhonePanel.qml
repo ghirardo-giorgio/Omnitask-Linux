@@ -19,8 +19,25 @@ ColumnLayout {
 
     spacing: 6
 
-    Component.onCompleted: KdeConnect.watch()
+    Component.onCompleted: {
+        KdeConnect.watch();
+        // Lo stato ADB non lo tiene nessuno: si guarda all'accensione del
+        // pannello e poi al ritmo di tutto il resto.
+        PhoneAdb.peek();
+    }
+
     Component.onDestruction: KdeConnect.unwatch()
+
+    // Lo stesso giro della batteria, per la stessa ragione: un collegamento
+    // che cade non lo annuncia nessuno, e trenta secondi di ritardo su un
+    // pallino sono ritardo che non si nota. Costa un `adb devices` — niente
+    // ascolto mDNS, che qui sarebbe dieci volte tanto per la stessa risposta.
+    Timer {
+        interval: KdeConnect.pollInterval
+        running: true
+        repeat: true
+        onTriggered: PhoneAdb.peek()
+    }
 
     // I motivi arrivano dal collector come codici, non come frasi: le parole
     // le sceglie chi mostra il dato, cosi' la stessa risposta serve il
@@ -35,6 +52,61 @@ ColumnLayout {
             return I18n.t("GSConnect non pubblica la batteria");
         }
         return "";
+    }
+
+    // Una targhetta di stato: tre lettere e un colore.
+    //
+    // Verde acceso, rosso spento, ambra "c'e' ma non e' utilizzabile", grigio
+    // "non lo so ancora". Sono tre lettere e non un pallino perche' i pallini
+    // qui sono due e uno accanto all'altro non si distinguerebbero: chi guarda
+    // deve sapere *quale* dei due collegamenti manca, che e' tutto il punto.
+    component Badge: Rectangle {
+        id: badge
+
+        required property string label
+        // "on", "off", "half", "unknown"
+        // Non `state`: quello e' gia' di Item, ed e' la macchina a stati
+        // delle transizioni. Un giorno qualcuno ne aggiungerebbe una a
+        // questo rettangolo e se la troverebbe agganciata a "on"/"off".
+        required property string linkState
+        property string hint: ""
+
+        readonly property color tint: {
+            switch (badge.linkState) {
+            case "on":
+                return "#3fb950";
+            case "off":
+                return "#f85149";
+            case "half":
+                return "#d29922";
+            }
+            return "#484f58";
+        }
+
+        implicitWidth: mark.implicitWidth + 10
+        implicitHeight: 13
+        radius: 3
+        color: "transparent"
+        border.width: 1
+        border.color: Qt.rgba(badge.tint.r, badge.tint.g, badge.tint.b, 0.45)
+
+        Text {
+            id: mark
+
+            anchors.centerIn: parent
+            color: badge.tint
+            font.pixelSize: 8
+            text: badge.label
+        }
+
+        HoverHandler {
+            id: badgeHover
+        }
+
+        Tooltip {
+            hovered: badgeHover.hovered
+            text: badge.hint
+        }
     }
 
     RowLayout {
@@ -223,15 +295,80 @@ ColumnLayout {
                 Layout.leftMargin: 4
                 spacing: 5
 
-                // Gli indirizzi si mostrano solo quando non c'e' niente di piu'
-                // urgente da dire, ed e' l'unico caso in cui ha senso offrirne
-                // la copia: un messaggio d'errore negli appunti non serve a
-                // nessuno.
                 readonly property string addresses: (device.modelData.addresses ?? []).join(", ")
-                readonly property bool showingAddresses: !device.status && device.modelData.reachable && device.battery && addresses !== ""
+
+                // Lo stato ADB di questo telefono, o null finche' non si sa.
+                // Per nome, e in mancanza per indirizzo: un telefono col cavo
+                // attaccato che KDE Connect non raggiunge ha comunque lo
+                // stesso nome nei due elenchi, ma la ricerca per indirizzo
+                // copre il caso in cui non ce l'abbia.
+                readonly property var adb: PhoneAdb.link(device.modelData.name)
+                    ?? (line.addresses !== "" ? PhoneAdb.link((device.modelData.addresses ?? [])[0] ?? "") : null)
+
+                // Quello che c'e' da dire sotto il nome. Calcolato una volta
+                // perche' lo guardano in due: il testo e il tasto di copia, che
+                // ha senso solo se quel testo e' un indirizzo — un messaggio
+                // d'errore negli appunti non serve a nessuno.
+                //
+                // «Non raggiungibile» non c'e' piu' fra i casi: adesso lo dice
+                // la targhetta KDE, in rosso, e ripeterlo a parole toglierebbe
+                // il posto all'indirizzo — che e' proprio quello che serve
+                // quando si sta cercando di capire perche' non si collega.
+                readonly property string detail: {
+                    if (device.status)
+                        return device.status.text;
+                    if (device.modelData.reachable && !device.battery)
+                        return root.reasonText(device.modelData.battery_unknown ?? "");
+                    return line.addresses;
+                }
+
+                readonly property bool showingAddresses: !device.status
+                    && line.detail === line.addresses && line.addresses !== ""
 
                 // torna da se' all'icona dopo aver confermato
                 property bool copied: false
+
+                // I due collegamenti, separati perche' sono separati davvero.
+                // Restano tutti e due sempre a video: quello acceso conferma,
+                // quello spento dice cosa accendere, e uno che sparisce
+                // lascerebbe credere che non esista.
+                Badge {
+                    label: "ADB"
+                    linkState: {
+                        if (!PhoneAdb.linksKnown || !line.adb)
+                            return "unknown";
+                        if (line.adb.connected)
+                            return "on";
+                        if (line.adb.adb !== "")
+                            return "half";
+                        return "off";
+                    }
+                    hint: {
+                        if (!PhoneAdb.linksKnown)
+                            return I18n.t("lettura…");
+                        if (line.adb && line.adb.connected)
+                            return line.adb.via === "usb"
+                                ? I18n.t("ADB collegato col cavo")
+                                : I18n.t("ADB collegato senza fili");
+                        if (line.adb && line.adb.adb === "unauthorized")
+                            return I18n.t("ADB: conferma la richiesta sullo schermo del telefono, o riassocia con ⚯");
+                        if (line.adb && line.adb.adb !== "")
+                            return I18n.t("ADB: collegamento fermo (%1)").arg(line.adb.adb);
+                        return I18n.t("ADB non collegato: accendi Debug wireless sul telefono, poi apri la sua finestra e premi Collega");
+                    }
+                }
+
+                Badge {
+                    label: "KDE"
+                    linkState: {
+                        if (!KdeConnect.loaded)
+                            return "unknown";
+                        return device.modelData.reachable ? "on" : "off";
+                    }
+                    hint: device.modelData.reachable
+                        ? I18n.t("KDE Connect collegato")
+                        : I18n.t("KDE Connect non risponde: apri l'app sul telefono e controlla che sia sulla stessa rete")
+                }
 
                 Text {
                     Layout.fillWidth: true
@@ -246,18 +383,7 @@ ColumnLayout {
                         return device.modelData.reachable ? "#6e7681" : "#484f58";
                     }
 
-                    text: {
-                        if (device.status)
-                            return device.status.text;
-                        if (!device.modelData.reachable)
-                            return I18n.t("non raggiungibile");
-                        if (!device.battery)
-                            return root.reasonText(device.modelData.battery_unknown ?? "");
-                        // Su quale rete risponde: meta' della risposta a
-                        // "perche' non si collega" e' che il telefono e' su
-                        // un'altra.
-                        return line.addresses;
-                    }
+                    text: line.detail
                 }
 
                 // Copia l'indirizzo: e' quello che si incolla in un ping, in un
@@ -293,6 +419,42 @@ ColumnLayout {
 
                         interval: 1200
                         onTriggered: line.copied = false
+                    }
+                }
+
+                // Riassocia: per quando e' il telefono a togliere
+                // l'autorizzazione — la chiave del debug USB revocata, o
+                // questo PC dimenticato fra i dispositivi accoppiati del debug
+                // wireless. Da qui non si puo' fare niente di piu' che aprire
+                // la finestra: le sei cifre del nuovo accoppiamento vanno
+                // lette sul telefono e digitate, e in una riga alta dieci
+                // pixel non c'e' posto per una conversazione.
+                //
+                // Sempre presente, come le frecce degli appunti: un pulsante
+                // che compare solo nei guai e' un pulsante che nei guai non si
+                // sa di avere.
+                //
+                // Gli anelli intrecciati e non la freccia circolare: quella
+                // nella dashboard vuol dire gia' «rileggi», e qui accanto a
+                // «Aggiorna» sarebbe la stessa parola per due cose diverse.
+                Text {
+                    color: repairHover.hovered ? "#58a6ff" : "#484f58"
+                    font.pixelSize: 10
+                    text: "⚯"
+
+                    HoverHandler {
+                        id: repairHover
+
+                        cursorShape: Qt.PointingHandCursor
+                    }
+
+                    TapHandler {
+                        onSingleTapped: DashActions.repairPhone(device.modelData.name)
+                    }
+
+                    Tooltip {
+                        hovered: repairHover.hovered
+                        text: I18n.t("Riassocia: il telefono ha tolto l'autorizzazione")
                     }
                 }
             }

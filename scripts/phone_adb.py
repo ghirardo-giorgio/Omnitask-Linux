@@ -27,14 +27,46 @@ quelli la strada e' `adb tcpip 5555` da collegati col cavo, e da li' in poi la
 porta e' fissa. `connect` prova comunque la 5555 quando l'annuncio mDNS manca,
 cosi' i due casi si comportano allo stesso modo da fuori.
 
+L'accoppiamento invece si fa una volta sola e basta: la chiave sta in
+~/.android/adbkey e il telefono la ricorda finche' non gli si revocano le
+autorizzazioni. Quello che cambia e' solo la porta, e infatti la porta che ha
+funzionato si scrive in ~/.cache/quickshell/phone-adb.json: al riavvio della
+dashboard `connect` la prova per prima e di solito entra senza ascoltare
+niente. Se non entra si torna all'annuncio, e la cache si riscrive da se'.
+
+Due annunci per lo stesso telefono non sono un errore: quello dell'accensione
+precedente resta nella cache di mDNS mentre la sua porta e' gia' morta. Per
+questo si provano tutte le porte note invece di sceglierne una — sceglierne
+una voleva dire indovinare, e sbagliando si finiva per rifare un pairing che
+era gia' a posto.
+
 L'autorizzazione resta sempre e solo sul telefono: la chiave RSA la si conferma
 li' la prima volta, e il codice di pairing lo legge l'utente dallo schermo.
 Qui non c'e' niente che possa aggirare quel passaggio, ne' che lo voglia.
+
+Guardare lo schermo si puo' in due modi, e sono diversi apposta. `screenshot`
+scatta una foto e finisce li'. `live` resta aperto: fotografa a intervalli,
+scrive i PNG a turno su due file in XDG_RUNTIME_DIR e legge da stdin i gesti da
+fare, che esegue senza ricalcolare ogni volta di che telefono si parla — un
+tocco costa cosi' cinque centesimi di secondo invece di un quarto. Il tetto e'
+la cattura in se': mezzo secondo, speso sul telefono, che nessuna astuzia da
+questa parte del cavo puo' abbreviare.
+
+Quindi non e' un mirroring, e non lo diventera' passando di qui: `screenrecord`
+in pipe su ffmpeg non emette un fotogramma finche' la pipe resta aperta, e i
+gesti a due dita non esistono affatto — `input` ha un dito solo e scrivere su
+/dev/input lo vieta SELinux anche allo shell di adb. Per quello c'e' `mirror`,
+che apre scrcpy: un programma a parte, che sul telefono ci mette un pezzo suo.
 
 Oltre a comandare, sa leggere: `screen` restituisce le scritte presenti sullo
 schermo con il punto dove toccarle, e `tap-text` prende l'etichetta al posto
 delle coordinate. Sono la coppia che serve a un modello per lavorare senza
 indovinare pixel — guarda, tocca, riguarda.
+
+`pointer` dice dov'e' il cursore del mouse, che e' l'unica posizione che
+Android si ricordi: un dito appoggiato ha delle coordinate finche' sta giu' e
+poi non le ha piu', un cursore invece resta dov'e'. Vuole pero' un mouse
+collegato, e il mirroring ne monta uno finto apposta.
 
 Sa anche scattare: `photo` comanda MacroCam, l'app headless che sceglie fra
 ottica normale e macro, legge il testo con l'OCR e lascia la foto dove adb la
@@ -44,8 +76,9 @@ punta alla cieca — e da li' in poi ogni scatto esce gia' ritagliato sull'area
 scelta. `camera` invece guarda e basta: le lenti come le racconta la HAL,
 anche senza l'app installata.
 
-Le letture (`status`, `apps`, `screen`, `camera`) e le azioni (`connect`, `pair`,
-`launch`, `input`, `tap-text`, `open`, `screenshot`, `photo`, `aim`) stanno in sottocomandi separati per la stessa
+Le letture (`status`, `apps`, `screen`, `pointer`, `camera`) e le azioni (`connect`,
+`pair`, `repair`, `forget`, `launch`, `input`, `tap-text`, `open`, `screenshot`,
+`photo`, `aim`) stanno in sottocomandi separati per la stessa
 ragione per cui kdeconnect.py tiene --send dietro un argomento esplicito: il
 server MCP espone le due famiglie come due tool distinti, e una domanda non
 deve poter toccare il telefono per sbaglio.
@@ -54,7 +87,11 @@ import argparse
 import json
 import os
 import re
-import shutil
+import select
+import shlex
+import signal
+import struct
+import zlib
 import subprocess
 import sys
 import time
@@ -63,8 +100,13 @@ import xml.etree.ElementTree as ET
 HERE = os.path.dirname(os.path.abspath(__file__))
 KDECONNECT = os.path.join(HERE, "kdeconnect.py")
 
-ADB = shutil.which("adb")
-AVAHI = shutil.which("avahi-browse")
+# I percorsi scritti in ~/.config/quickshell/tools.json vincono sul PATH: vedi
+# tools.py. Serve soprattutto ad `adb`, che su Fedora e' compilato senza mDNS.
+import tools  # noqa: E402  (dopo HERE, che e' cio' che lo rende importabile)
+
+ADB = tools.which("adb")
+AVAHI = tools.which("avahi-browse")
+SCRCPY = tools.which("scrcpy")
 
 TIMEOUT = 20
 
@@ -75,10 +117,33 @@ CONNECT = "_adb-tls-connect._tcp"
 # Fissa per definizione: e' il numero che si scrive a mano da sempre.
 LEGACY_PORT = 5555
 
+# Dove si ricorda la porta del debug wireless fra un avvio e l'altro. E'
+# cache e non configurazione: se il file sparisce non si perde niente che mDNS
+# non sappia ritrovare, ci si rimette solo l'attesa dell'ascolto.
+CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "quickshell",
+    "phone-adb.json",
+)
+
+# Dove la sessione `live` posa i frame: tmpfs, come XDG_RUNTIME_DIR e' fatto
+# per essere. Due immagini al secondo su disco vero sarebbero scritture inutili
+# di roba che non serve fra un secondo.
+LIVE_DIR = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or "/run/user/%d" % os.getuid(),
+    "quickshell-phone",
+)
+
 NO_ADB = "adb non e' installato (pacchetto android-tools)"
 NO_AVAHI = (
     "avahi-browse non e' installato: senza mDNS le porte del debug wireless "
     "vanno lette a mano dal telefono"
+)
+
+NO_SCRCPY = (
+    "scrcpy non e' installato: `sudo dnf install scrcpy` (e' nei repo, versione "
+    "4.0). E' l'unico modo di avere lo schermo in tempo reale e i gesti a due "
+    "dita — via adb non esistono, e questo file non puo' inventarli"
 )
 
 
@@ -176,6 +241,110 @@ def browse(*services, seconds=2.5):
     return found
 
 
+def load_cache():
+    """Le porte gia' viste: {ip: {"name", "port", "paired", "seen"}}.
+
+    Un file illeggibile vale come un file assente: chi legge questa cache ha
+    sempre l'annuncio mDNS come alternativa, e far fallire un `connect` per un
+    JSON troncato sarebbe peggio del guasto che si vuole evitare.
+    """
+    try:
+        with open(CACHE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def save_cache(data):
+    """Scrive la cache, e se non ci riesce tace.
+
+    Il file si sostituisce invece di riscriverlo sul posto: due finestre che si
+    collegano insieme scrivono lo stesso file, e a meta' di una riscrittura
+    diretta il secondo lettore troverebbe un JSON tagliato.
+    """
+    tmp = CACHE + ".tmp"
+
+    try:
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
+
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False)
+
+        os.replace(tmp, CACHE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def remember(ip, name="", port=0, paired=None):
+    """Segna che con questo indirizzo si e' entrati, e su che porta."""
+    if not ip:
+        return
+
+    data = load_cache()
+    entry = data.get(ip)
+    entry = dict(entry) if isinstance(entry, dict) else {}
+
+    if name:
+        entry["name"] = name
+
+    if port:
+        entry["port"] = int(port)
+
+    if paired is not None:
+        entry["paired"] = bool(paired)
+
+    entry["seen"] = int(time.time())
+    data[ip] = entry
+    save_cache(data)
+
+
+def forget(target=""):
+    """Toglie dalla cache un telefono, o tutti quando target e' vuoto."""
+    data = load_cache()
+
+    if not target:
+        save_cache({})
+        return sorted(data)
+
+    needle = target.lower()
+    flat = flatten(target)
+    gone = [
+        ip for ip, entry in data.items()
+        if needle == ip.lower()
+        or needle in ((entry or {}).get("name") or "").lower()
+        or (flat and flat in flatten((entry or {}).get("name")))
+    ]
+
+    for ip in gone:
+        data.pop(ip, None)
+
+    if gone:
+        save_cache(data)
+
+    return gone
+
+
+def order_ports(ports, first=0):
+    """Le porte in ordine di probabilita', senza ripetizioni.
+
+    In testa quella che ha funzionato l'ultima volta, quando c'e' ancora: se il
+    telefono non ha riacceso il debug wireless e' ancora buona, e provarla per
+    prima e' la differenza fra un tentativo e tre.
+    """
+    out = [int(first)] if first and int(first) in ports else []
+
+    for port in ports:
+        if port not in out:
+            out.append(int(port))
+
+    return out
+
+
 def paired_phones():
     """I telefoni di KDE Connect, per dare un nome agli indirizzi."""
     try:
@@ -262,6 +431,71 @@ def model_of(serial):
     return (out or "").strip() if ok else ""
 
 
+def hw_serial(serial):
+    """Il numero di fabbrica, che e' lo stesso sul cavo e sul wi-fi.
+
+    Il serial adb non lo e': e' «ip:porta» quando si passa dalla rete e il
+    numero vero quando si passa dal cavo, cosi' lo stesso apparecchio collegato
+    in tutti e due i modi compare due volte e non si somiglia. Il modello non
+    basta a riconciliarli — due telefoni uguali in casa lo hanno identico —
+    mentre questo e' unico per apparecchio.
+    """
+    ok, out, _ = adb("-s", serial, "shell", "getprop", "ro.serialno", timeout=10)
+
+    return (out or "").strip() if ok else ""
+
+
+def fold_transports(out):
+    """Lo stesso telefono visto da due strade torna a essere una voce sola.
+
+    Senza questo, un apparecchio con il cavo attaccato e il debug wireless
+    acceso conta per due, e `pick` si ferma a chiedere quale dei due si
+    intendeva: una domanda a cui non c'e' risposta, perche' sono lo stesso.
+
+    Si paga un getprop per apparecchio, e solo quando ce n'e' piu' d'uno
+    collegato: con uno solo non c'e' niente da fondere e niente da chiedere.
+    """
+    live = [d for d in out if d["connected"]]
+
+    if len(live) < 2:
+        return out
+
+    groups = {}
+
+    for device in live:
+        hw = hw_serial(device["serial"])
+
+        if hw:
+            groups.setdefault(hw, []).append(device)
+
+    dropped = []
+
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+
+        # Chi ha un'identita' KDE Connect porta con se' nome, indirizzo e
+        # porte, e quindi e' la voce che resta; il cavo pero' e' il trasporto
+        # migliore quando c'e'. Le due cose possono venire da voci diverse.
+        keep = next((d for d in group if d["id"]), group[0])
+        best = next((d for d in group if d["via"] == "usb"), keep)
+
+        # Le due strade si annotano prima di toccare qualsiasi cosa: `keep` sta
+        # dentro `group`, e riletto dopo racconterebbe due volte il trasporto
+        # che ha appena adottato. L'altra non sparisce, smette solo di essere
+        # un altro telefono — chi cercava per il serial wireless lo ritrova.
+        keep["transports"] = [{"via": d["via"], "serial": d["serial"]} for d in group]
+
+        keep["serial"] = best["serial"]
+        keep["adb"] = best["adb"]
+        keep["via"] = best["via"]
+        keep["name"] = keep["name"] or next((d["name"] for d in group if d["name"]), "")
+
+        dropped += [d for d in group if d is not keep]
+
+    return [d for d in out if not any(d is gone for gone in dropped)]
+
+
 def devices_view(discover=True):
     """Lo stato completo: telefoni noti, annunci mDNS e device adb, uniti.
 
@@ -277,8 +511,21 @@ def devices_view(discover=True):
     """
     phones = paired_phones()
     seen = browse(CONNECT, PAIRING) if discover else {CONNECT: [], PAIRING: []}
-    announced = {entry["ip"]: entry["port"] for entry in seen[CONNECT]}
-    pairing = {entry["ip"]: entry["port"] for entry in seen[PAIRING]}
+    known = load_cache()
+
+    # Tutte le porte annunciate per ogni indirizzo, non l'ultima vista. Un
+    # telefono ne annuncia una sola per accensione, ma quella dell'accensione
+    # precedente resta nella cache di mDNS finche' non scade: tenerne una e
+    # buttare l'altra vuol dire tirare a sorte fra la porta viva e una morta.
+    announced = {}
+    pairing = {}
+
+    for entry in seen[CONNECT]:
+        announced.setdefault(entry["ip"], []).append(entry["port"])
+
+    for entry in seen[PAIRING]:
+        pairing.setdefault(entry["ip"], []).append(entry["port"])
+
     live = attached()
 
     # serial adb -> ip, per le connessioni wireless (il serial e' "ip:porta")
@@ -301,6 +548,8 @@ def devices_view(discover=True):
         addresses = phone.get("addresses") or []
         ip = addresses[0] if addresses else ""
         serial = by_ip.get(ip, "") or by_model.get(flatten(phone.get("name", "")), "")
+        remembered = known.get(ip) or {}
+        ports = order_ports(announced.get(ip, []), remembered.get("port") or 0)
 
         if serial:
             claimed.add(serial)
@@ -313,10 +562,15 @@ def devices_view(discover=True):
             "adb": live.get(serial, "") if serial else "",
             "connected": bool(serial) and live.get(serial) == "device",
             "via": ("usb" if serial and ":" not in serial else "wireless") if serial else "",
-            # La porta annunciata cambia a ogni accensione del debug wireless:
-            # e' un dato di adesso, non una configurazione da ricordare.
+            # Le porte annunciate adesso, piu' quella che ha funzionato
+            # l'ultima volta: la prima cambia a ogni accensione del debug
+            # wireless, la seconda e' un ricordo che vale finche' non si
+            # riaccende, e insieme evitano di dover chiedere niente all'utente.
             "wireless_debugging": ip in announced,
-            "wireless_port": announced.get(ip, 0),
+            "wireless_ports": ports,
+            "wireless_port": ports[0] if ports else 0,
+            "known_port": int(remembered.get("port") or 0),
+            "paired": bool(remembered.get("paired")),
             "pairing_open": ip in pairing,
         })
 
@@ -334,12 +588,37 @@ def devices_view(discover=True):
             "adb": state,
             "connected": state == "device",
             "wireless_debugging": False,
+            "wireless_ports": [],
             "wireless_port": 0,
+            "known_port": 0,
+            "paired": False,
             "pairing_open": False,
             "via": "usb" if ":" not in serial else "wireless",
         })
 
-    return out
+    return fold_transports(out)
+
+
+def matching(view, target):
+    """I device che rispondono a quel nome, indirizzo o serial.
+
+    Separata da `pick` perche' non tutti i comandi vogliono la stessa cosa:
+    `pick` cerca un telefono su cui agire e quindi scarta chi non e' collegato,
+    mentre `repair` cerca proprio quello — un telefono che c'e' ma non risponde
+    piu' e' esattamente il caso da rimettere in piedi.
+    """
+    needle = target.lower()
+    flat = flatten(target)
+
+    return [
+        d for d in view
+        if needle in (d["name"] or "").lower()
+        or (flat and flat in flatten(d["name"]))
+        or needle == d["ip"]
+        or needle == d["serial"].lower()
+        or needle == d["id"].lower()
+        or any(needle == t["serial"].lower() for t in d.get("transports", []))
+    ]
 
 
 def pick(view, target):
@@ -364,16 +643,7 @@ def pick(view, target):
         names = ", ".join(d["name"] or d["serial"] for d in connected)
         return None, f"piu' di un telefono collegato ({names}): indica quale con --device"
 
-    needle = target.lower()
-    flat = flatten(target)
-    hits = [
-        d for d in view
-        if needle in (d["name"] or "").lower()
-        or (flat and flat in flatten(d["name"]))
-        or needle == d["ip"]
-        or needle == d["serial"].lower()
-        or needle == d["id"].lower()
-    ]
+    hits = matching(view, target)
 
     if not hits:
         return None, f"nessun telefono corrisponde a «{target}»"
@@ -390,14 +660,101 @@ def pick(view, target):
 # ------------------------------------------------------------------ azioni
 
 
-def do_connect(target=""):
+def connect_reply(results, note=""):
+    """La risposta di un `connect`, con quello che resta da fare sul telefono.
+
+    La chiave RSA si conferma sul telefono, e finche' non lo si fa il device
+    resta "unauthorized": dirlo qui evita di far cercare il guasto altrove.
+    """
+    unauthorized = [s for s, state in read_devices().items() if state == "unauthorized"]
+
+    return {
+        "ok": any(r["ok"] for r in results),
+        "results": results,
+        "unauthorized": unauthorized,
+        "note": note or (
+            "conferma la richiesta «Consentire il debug USB?» sullo schermo del "
+            "telefono" if unauthorized else ""
+        ),
+    }
+
+
+def connect_known(target=""):
+    """Il tentativo con le porte gia' ricordate, senza mDNS ne' KDE Connect.
+
+    E' la strada di chi riavvia la dashboard a telefono acceso: la porta e'
+    ancora quella di prima, e provarla costa un `adb connect` invece dei due
+    secondi e mezzo di ascolto piu' l'interrogazione di KDE Connect.
+
+    Torna qualcosa solo se qualcuno e' entrato. Un fallimento qui non e' una
+    risposta da dare a chi ha chiesto `connect` — e' solo il segnale che tocca
+    cercare l'annuncio.
+    """
+    known = load_cache()
+
+    if not known:
+        return None
+
+    needle = target.lower() if target else ""
+    flat = flatten(target)
+    live = read_devices()
+    joined = []
+
+    for ip, entry in known.items():
+        entry = entry or {}
+        port = int(entry.get("port") or 0)
+        name = entry.get("name") or ""
+
+        if not port:
+            continue
+
+        if needle and needle != ip.lower() and needle not in name.lower() \
+                and not (flat and flat in flatten(name)):
+            continue
+
+        serial = f"{ip}:{port}"
+
+        if live.get(serial) == "device":
+            continue
+
+        ok, out, _ = adb("connect", serial, timeout=8)
+        text = (out or "").strip()
+
+        if ok and "connected to" in text:
+            remember(ip, name, port, paired=True)
+            joined.append({
+                "name": name,
+                "ip": ip,
+                "ok": True,
+                "serial": serial,
+                "note": text,
+            })
+
+    if not joined:
+        return None
+
+    return connect_reply(joined, "collegato sulla porta gia' nota, senza cercare l'annuncio")
+
+
+def do_connect(target="", fast=True):
     """Collega ad adb i telefoni raggiungibili, senza scrivere porte.
 
-    Si prova prima la porta annunciata via mDNS, che e' quella del debug
-    wireless di Android 11+, e poi la 5555 di `adb tcpip`: un telefono ha una
-    delle due, mai tutte e due, e provarle entrambe evita di dover sapere in
-    anticipo di che generazione e'.
+    Due strade, in quest'ordine. La prima e' la porta ricordata dall'ultima
+    volta, che non costa attesa; la seconda e' quella di sempre — guardare chi
+    annuncia il debug wireless — e scatta solo se la prima non ha collegato
+    niente.
+
+    Le porte da provare sono tutte quelle note: la ricordata, quelle annunciate
+    adesso (possono essere piu' d'una, perche' l'annuncio di un'accensione
+    precedente resta in giro) e infine la 5555 di `adb tcpip`. Un telefono ne ha
+    una sola buona, e quale sia non si sa prima di provarla.
     """
+    if fast:
+        quick = connect_known(target)
+
+        if quick:
+            return quick
+
     view = devices_view()
 
     wanted = []
@@ -429,8 +786,10 @@ def do_connect(target=""):
 
     for device in wanted:
         ip = device["ip"]
-        ports = [device["wireless_port"]] if device["wireless_port"] else []
-        ports.append(LEGACY_PORT)
+        ports = order_ports(
+            list(device["wireless_ports"]) + [LEGACY_PORT],
+            device["known_port"],
+        )
 
         outcome = {"name": device["name"], "ip": ip, "ok": False, "error": ""}
         # Ogni tentativo con la sua porta: la 5555 rifiutata dice solo che il
@@ -447,6 +806,9 @@ def do_connect(target=""):
             # connect" e "Connection refused".
             if ok and ("connected to" in text):
                 outcome.update({"ok": True, "serial": f"{ip}:{port}", "note": text})
+                # Da qui in poi questa porta si prova per prima, e se e' ancora
+                # buona al prossimo avvio non si ascolta piu' niente.
+                remember(ip, device["name"], port, paired=True)
                 break
 
             attempts.append({"port": port, "error": text or err})
@@ -462,6 +824,10 @@ def do_connect(target=""):
             # continua ad annunciare il servizio — l'annuncio resta nella cache
             # di mDNS mentre adbd ha gia' smesso di ascoltare — e dirgli di
             # rifare il pairing manderebbe a rifare una cosa gia' fatta.
+            #
+            # Lo stesso vale per chi ha gia' un accoppiamento riuscito alle
+            # spalle: il pairing non scade da solo, e mandarlo a rifare e' il
+            # consiglio che fa credere che vada rifatto a ogni avvio.
             outcome["hint"] = (
                 "il telefono annuncia il debug wireless ma non risponde su "
                 "quella porta: di solito sta dormendo, quindi accendigli lo "
@@ -472,6 +838,13 @@ def do_connect(target=""):
                 "rifiutata: questo PC non e' accoppiato con quel telefono — "
                 "apri «Accoppia dispositivo con codice» e lancia `pair <codice>`"
             ) if device["wireless_debugging"] else (
+                "questo PC e' gia' accoppiato con quel telefono e il pairing "
+                "non va rifatto: il telefono non sta annunciando il debug "
+                "wireless, quindi accendigli lo schermo e controlla che Debug "
+                "wireless sia ancora acceso. Se invece e' il telefono ad aver "
+                "dimenticato questo PC (Debug wireless -> Dispositivi "
+                "accoppiati), lancia `repair` e riaccoppia col codice"
+            ) if device["paired"] else (
                 "il telefono non annuncia il debug wireless: accendilo in "
                 "Opzioni sviluppatore → Debug wireless, poi rifai `pair` se "
                 "e' la prima volta"
@@ -479,20 +852,139 @@ def do_connect(target=""):
 
         results.append(outcome)
 
-    # La chiave RSA si conferma sul telefono, e finche' non lo si fa il device
-    # resta "unauthorized": dirlo qui evita di far cercare il guasto altrove.
-    live = attached()
-    unauthorized = [s for s, state in live.items() if state == "unauthorized"]
+    return connect_reply(results)
+
+
+def do_forget(target=""):
+    """Dimentica le porte salvate, tutte o quelle di un telefono.
+
+    Serve quando si cambia rete o telefono e la porta ricordata punta a
+    qualcosa che non esiste piu': la cache si corregge anche da sola al primo
+    tentativo fallito, ma poterla svuotare a mano evita di doverlo indovinare.
+    """
+    gone = forget(target)
+
+    if target and not gone:
+        return {"ok": False, "error": f"nessuna porta salvata per «{target}»"}
 
     return {
-        "ok": any(r["ok"] for r in results),
-        "results": results,
-        "unauthorized": unauthorized,
+        "ok": True,
+        "forgotten": gone,
         "note": (
-            "conferma la richiesta «Consentire il debug USB?» sullo schermo del "
-            "telefono" if unauthorized else ""
+            "il prossimo `connect` ripartira' dall'annuncio mDNS" if gone
+            else "non c'era niente da dimenticare"
         ),
     }
+
+
+def do_repair(target=""):
+    """Rimette in gioco un telefono che ha tolto l'autorizzazione.
+
+    L'autorizzazione la toglie il telefono, e lo fa in due modi che si
+    somigliano solo nel risultato. Con «Revoca autorizzazioni debug USB» sparisce
+    la chiave RSA: adb continua a elencarlo, ma come `unauthorized`, e il rimedio
+    e' far ricomparire la richiesta sullo schermo — l'accoppiamento wireless non
+    c'entra e rifarlo non servirebbe a niente. Con «Debug wireless → Dispositivi
+    accoppiati → dimentica» sparisce invece l'accoppiamento, e li' l'unica strada
+    e' il codice a sei cifre; ma la cache di qui continua a dire `paired`, e
+    finche' lo dice ogni consiglio che ne discende — a partire da «il pairing non
+    va rifatto» — manda a cercare il guasto dalla parte sbagliata.
+
+    Quale dei due sia lo dice adb, quindi lo si guarda invece di chiederlo. La
+    risposta porta con se' lo stato fresco del telefono: chi l'ha chiesta ha
+    appena pagato l'ascolto mDNS, e fargli incatenare uno `status` vorrebbe dire
+    farglielo pagare due volte.
+    """
+    view = devices_view()
+
+    if target:
+        hits = matching(view, target)
+
+        if not hits:
+            return {"ok": False, "error": f"nessun telefono corrisponde a «{target}»"}
+    else:
+        hits = view
+
+        if not hits:
+            return {"ok": False, "error": "nessun telefono da rimettere in piedi"}
+
+        if len(hits) > 1:
+            names = ", ".join(d["name"] or d["ip"] or d["serial"] for d in hits)
+            return {
+                "ok": False,
+                "error": f"piu' di un telefono ({names}): indica quale con --device",
+            }
+
+    device = hits[0]
+    state = {
+        "name": device["name"],
+        "ip": device["ip"],
+        "serial": device["serial"],
+        "adb": device["adb"],
+        "paired": device["paired"],
+        "pairing_open": device["pairing_open"],
+    }
+
+    # La chiave RSA: il telefono e' li' e adb lo vede, manca solo il consenso.
+    # Staccare e riattaccare la sessione e' quello che fa ricomparire la
+    # finestra, che altrimenti non torna da sola.
+    if device["adb"] == "unauthorized":
+        serial = device["serial"]
+
+        if ":" in serial:
+            adb("disconnect", serial, timeout=10)
+            adb("connect", serial, timeout=12)
+        else:
+            adb("reconnect", serial, timeout=15)
+
+        time.sleep(1.5)
+        state["adb"] = read_devices().get(serial, "")
+
+        return dict(state, ok=True, step="authorize", note=(
+            "conferma la richiesta «Consentire il debug USB?» sullo schermo del "
+            "telefono, e spunta «Consenti sempre da questo computer»"
+        ))
+
+    # L'indirizzo puo' mancare: KDE Connect lo pubblica solo mentre il telefono
+    # risponde, e un telefono da riaccoppiare e' proprio un telefono che non
+    # risponde. Quello con cui si e' entrati l'ultima volta e' nella cache, ed
+    # e' il migliore che ci sia — l'unica alternativa sarebbe chiederlo.
+    ip = device["ip"]
+
+    if not ip:
+        flat = flatten(device["name"])
+
+        for known, entry in load_cache().items():
+            if flat and flat == flatten((entry or {}).get("name")):
+                ip = known
+                break
+
+        state["ip"] = ip
+
+    # Senza indirizzo non c'e' niente da riaccoppiare: e' un telefono che vive
+    # solo sul cavo, e sul cavo l'autorizzazione e' la chiave RSA di sopra.
+    if not ip:
+        return {
+            "ok": False,
+            "error": "questo telefono non ha un indirizzo: non c'e' nessun "
+                     "accoppiamento wireless da rifare",
+            "hint": "col cavo l'autorizzazione e' la richiesta della chiave RSA: "
+                    "staccalo e riattaccalo per farla ricomparire",
+        }
+
+    # Il flag e basta: nome e porta restano. La porta ricordata e' ancora il
+    # primo tentativo piu' probabile dopo il nuovo accoppiamento, e buttarla via
+    # — cosa che farebbe `forget` — vorrebbe dire tornare a pagare l'ascolto
+    # mDNS per un dato che non era sbagliato.
+    remember(ip, device["name"], paired=False)
+    state["paired"] = False
+
+    return dict(state, ok=True, step="code", note=(
+        "il telefono sta chiedendo il codice: digita le sei cifre che mostra"
+        if device["pairing_open"] else
+        "sul telefono: Opzioni sviluppatore → Debug wireless → «Accoppia "
+        "dispositivo con codice di accoppiamento», poi digita qui le sei cifre"
+    ), hint="" if AVAHI else NO_AVAHI)
 
 
 def do_pair(code, target=""):
@@ -551,6 +1043,10 @@ def do_pair(code, target=""):
             "error": text or err or "pairing rifiutato",
             "hint": "il codice cambia a ogni apertura della finestra: rileggilo e riprova",
         }
+
+    # Il pairing non scade: da qui in poi il telefono conosce questo PC, e
+    # segnarlo evita che un connect fallito per altri motivi mandi a rifarlo.
+    remember(offer["ip"], paired=True)
 
     # Chiuso il pairing, il telefono comincia ad annunciare il servizio di
     # connessione: ci mette un istante, quindi vale la pena riprovare invece di
@@ -712,6 +1208,70 @@ def do_open(url, target=""):
     }
 
 
+def input_args(action, values):
+    """Gli argomenti di `input` per un gesto, o la ragione per cui non ce ne sono.
+
+    Sta fuori da do_input perche' la sessione `live` manda gli stessi gesti
+    senza rifare il giro di devices_view — che vuol dire interrogare KDE
+    Connect, un quinto di secondo per un tocco che ne costa cinque centesimi.
+    La traduzione e' la stessa, il contorno no.
+    """
+    values = [str(v) for v in values]
+
+    if action == "text":
+        text = " ".join(values)
+
+        if not text:
+            return None, "nessun testo da scrivere"
+
+        # Due accorgimenti, per due guai diversi. `input text` prende un
+        # argomento solo e degli spazi non sa che fare: la sequenza %s e' il
+        # modo con cui Android li scrive.
+        #
+        # E soprattutto gli apici: `adb shell` non passa gli argomenti al
+        # telefono uno per uno, li riattacca in una riga che di la' viene letta
+        # da una shell. Senza quotare, un punto e virgola in mezzo a una frase
+        # sarebbe un comando eseguito sul telefono — provato con `adb shell
+        # echo "a;pwd"`, che stampa "a" e poi "/". Con una tastiera collegata
+        # basterebbe digitare una & per finirci dentro senza volerlo.
+        return ["shell", "input", "text", shlex.quote(text.replace(" ", "%s"))], ""
+
+    if action == "key":
+        key = values[0] if values else ""
+
+        if not key:
+            return None, "key vuole il nome di un tasto"
+
+        if not key.isdigit() and not key.upper().startswith("KEYCODE_"):
+            key = "KEYCODE_" + key.upper()
+
+        return ["shell", "input", "keyevent", key], ""
+
+    if action in ("tap", "swipe"):
+        if not values or not all(v.lstrip("-").isdigit() for v in values):
+            return None, f"{action} vuole coordinate in pixel"
+
+        if action == "tap" and len(values) != 2:
+            return None, "tap vuole due coordinate: X Y"
+
+        if action == "swipe" and len(values) not in (4, 5):
+            return None, "swipe vuole X1 Y1 X2 Y2 [durata_ms]"
+
+        return ["shell", "input", action] + values, ""
+
+    # Le tre fasi di un dito appoggiato, mosso e sollevato. `input swipe` fa un
+    # gesto solo, dritto e a velocita' costante, che Android legge come un
+    # lancio; queste tre lasciano che sia la mano a decidere il percorso, ed e'
+    # l'unico modo di trascinare davvero qualcosa da qui.
+    if action in ("down", "move", "up"):
+        if len(values) != 2 or not all(v.lstrip("-").isdigit() for v in values):
+            return None, f"{action} vuole due coordinate: X Y"
+
+        return ["shell", "input", "motionevent", action.upper()] + values, ""
+
+    return None, f"azione sconosciuta: {action}"
+
+
 def do_input(action, values, target="", from_stdin=False):
     """Tocchi, scorrimenti, testo e tasti.
 
@@ -726,35 +1286,13 @@ def do_input(action, values, target="", from_stdin=False):
     if not device:
         return {"ok": False, "error": why}
 
-    if action == "text":
-        text = sys.stdin.read().rstrip("\n") if from_stdin else " ".join(values)
+    if action == "text" and from_stdin:
+        values = [sys.stdin.read().rstrip("\n")]
 
-        if not text:
-            return {"ok": False, "error": "nessun testo da scrivere"}
+    args, why = input_args(action, values)
 
-        # `input text` prende un argomento solo e degli spazi non sa che fare:
-        # la sequenza %s e' il modo con cui Android li scrive.
-        args = ["shell", "input", "text", text.replace(" ", "%s")]
-    elif action == "key":
-        key = values[0] if values else ""
-
-        if not key.isdigit() and not key.upper().startswith("KEYCODE_"):
-            key = "KEYCODE_" + key.upper()
-
-        args = ["shell", "input", "keyevent", key]
-    elif action in ("tap", "swipe"):
-        if not all(v.lstrip("-").isdigit() for v in values):
-            return {"ok": False, "error": f"{action} vuole coordinate in pixel"}
-
-        if action == "tap" and len(values) != 2:
-            return {"ok": False, "error": "tap vuole due coordinate: X Y"}
-
-        if action == "swipe" and len(values) not in (4, 5):
-            return {"ok": False, "error": "swipe vuole X1 Y1 X2 Y2 [durata_ms]"}
-
-        args = ["shell", "input", action] + list(values)
-    else:
-        return {"ok": False, "error": f"azione sconosciuta: {action}"}
+    if not args:
+        return {"ok": False, "error": why}
 
     ok, out, err = shell(device, *args)
 
@@ -853,6 +1391,16 @@ def do_unlock(target="", from_stdin=False):
     if not device:
         return {"ok": False, "error": why}
 
+    return unlock_device(device, sys.stdin.read().strip() if from_stdin else "")
+
+
+def unlock_device(device, pin=""):
+    """Lo sblocco vero e proprio, su un telefono gia' scelto.
+
+    Separato da do_unlock perche' anche la sessione `live` sblocca, e li' il
+    PIN arriva da una riga di comandi invece che dallo standard input: il
+    percorso del segreto cambia, il resto no.
+    """
     before = locked(device)
 
     if before is False:
@@ -871,8 +1419,6 @@ def do_unlock(target="", from_stdin=False):
     shell(device, "shell", "input", "swipe",
           str(width // 2), str(int(height * 0.8)),
           str(width // 2), str(int(height * 0.2)), "300", timeout=15)
-
-    pin = sys.stdin.read().strip() if from_stdin else ""
 
     if pin:
         shell(device, "shell", "input", "text", pin, timeout=15)
@@ -894,6 +1440,311 @@ def do_unlock(target="", from_stdin=False):
             "questo telefono ha un blocco: serve il PIN"
         ),
         "needs_pin": after is True and not pin,
+    }
+
+
+# --------------------------------------------------------------- sessione
+
+# Quanto veloce si puo' andare e quanto lento ha senso andare. Il tetto non e'
+# una scelta: una cattura costa quasi mezzo secondo sul telefono, e chiederne
+# piu' di cinque al secondo vorrebbe dire accodare richieste che arrivano tardi
+# comunque.
+FPS_MIN = 0.2
+FPS_MAX = 5.0
+
+# Dopo tanti errori di fila la sessione si arrende invece di insistere: se il
+# telefono si e' staccato, riprovare due volte al secondo non lo riattacca.
+LIVE_GIVE_UP = 3
+
+# I gesti che cambiano quello che c'e' sullo schermo, e dopo i quali vale la
+# pena guardare subito invece di aspettare il turno. `move` no: durante un
+# trascinamento le catture andrebbero a rilento proprio quando la mano si
+# muove, ed e' l'unico momento in cui la lentezza si vede.
+AFTER_SHOT = {"tap", "swipe", "key", "text", "up", "pin", "shot", "resume"}
+
+
+def do_live(target="", fps=2.0, out="", paused=False):
+    """La sessione interattiva: i frame su stdout, i comandi su stdin.
+
+    Un processo che resta aperto finche' la finestra e' aperta, e che fa due
+    cose insieme. Fotografa lo schermo a intervalli regolari, scrivendo il PNG
+    a turno su due file e annunciandolo con una riga JSON; e legge da stdin i
+    gesti da fare, che esegue con la scorciatoia di `input_args` — senza
+    ricalcolare ogni volta di che telefono si parla.
+
+    E' li' che sta il guadagno: lo stesso tocco passato da un processo nuovo
+    costa un quarto di secondo di avvio, da qui cinque centesimi. Quello che
+    non si puo' togliere e' il mezzo secondo della cattura, che avviene sul
+    telefono e non da questa parte del cavo.
+
+    Due nomi di file a turno, non uno nuovo per frame: il lettore ricarica
+    l'immagine solo se il nome cambia, e un file nuovo ogni mezzo secondo
+    riempirebbe la cartella di roba morta. Ognuno si scrive di fianco e poi si
+    sposta al suo posto, cosi' chi guarda non trova mai mezzo PNG.
+    """
+    view = devices_view(discover=False)
+    device, why = pick(view, target)
+
+    if not device:
+        return {"ok": False, "error": why}
+
+    folder = os.path.expanduser(out) if out else LIVE_DIR
+
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    # Il numero del processo nel nome: due finestre aperte sullo stesso
+    # telefono, o due dashboard, sono due sessioni che scrivono nella stessa
+    # cartella, e senza questo si sovrascriverebbero i frame a vicenda —
+    # peggio, chiudendone una si porterebbero via i file dell'altra.
+    slots = [
+        os.path.join(folder, "live-%d-%d.png" % (os.getpid(), n))
+        for n in (0, 1)
+    ]
+    state = {
+        "slot": 0,
+        "frame": 0,
+        "interval": 1.0 / min(max(fps, FPS_MIN), FPS_MAX),
+        # Si nasce fermi o in movimento a seconda di com'e' l'interruttore
+        # dall'altra parte. E' un argomento e non un comando su stdin perche'
+        # il primo giro parte prima che chiunque abbia avuto modo di scrivere.
+        "paused": paused,
+        "misses": 0,
+        # La strada veloce (pixel nudi, PNG rifatto qui) finche' funziona: su un
+        # telefono che manda i pixel in un formato che non si sa richiudere si
+        # torna al PNG del telefono, ma una volta sola, non a ogni frame.
+        "raw": True,
+    }
+
+    def say(payload):
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+
+    def capture():
+        """Uno scatto: sul file di turno, annunciato, o l'errore per cui non c'e'."""
+        start = time.monotonic()
+        data, error, used_raw = grab(device, timeout=30, raw=state["raw"])
+
+        if state["raw"] and data and not used_raw:
+            state["raw"] = False
+            say({"event": "state", "raw": False})
+
+        if not data:
+            state["misses"] += 1
+            say({"event": "miss", "error": error, "misses": state["misses"]})
+            return state["misses"] < LIVE_GIVE_UP
+
+        state["misses"] = 0
+        state["slot"] ^= 1
+        state["frame"] += 1
+        target_path = slots[state["slot"]]
+        tmp = target_path + ".tmp"
+
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(data)
+
+            os.replace(tmp, target_path)
+        except OSError as exc:
+            say({"event": "miss", "error": str(exc)})
+            return True
+
+        width, height = png_size(data)
+        say({
+            "event": "frame",
+            "raw": used_raw,
+            "frame": state["frame"],
+            "path": target_path,
+            "ms": int((time.monotonic() - start) * 1000),
+            "width": width,
+            "height": height,
+            "bytes": len(data),
+        })
+
+        return True
+
+    def act(verb, rest, raw):
+        """Un comando dalla riga: torna True se dopo vale la pena guardare."""
+        if verb == "pause":
+            state["paused"] = True
+            say({"event": "state", "paused": True})
+            return False
+
+        if verb == "resume":
+            state["paused"] = False
+            say({"event": "state", "paused": False})
+            return True
+
+        if verb == "fps":
+            try:
+                value = float(rest[0])
+            except (IndexError, ValueError):
+                say({"event": "error", "cmd": verb, "error": "fps vuole un numero"})
+                return False
+
+            state["interval"] = 1.0 / min(max(value, FPS_MIN), FPS_MAX)
+            say({"event": "state", "fps": round(1.0 / state["interval"], 2)})
+            return False
+
+        if verb == "shot":
+            return True
+
+        if verb == "pin":
+            # Il PIN arriva qui dentro una riga di stdin e non fra gli
+            # argomenti del processo, che e' l'unica differenza che conta: la
+            # riga di comando la legge chiunque, questo canale no.
+            done = unlock_device(device, " ".join(rest))
+            say({"event": "unlock", **done})
+            return True
+
+        if verb == "text":
+            # Il testo si prende dalla riga cruda: fare split e rijoin
+            # mangerebbe gli spazi doppi, e chi scrive un messaggio li mette
+            # dove vuole lui.
+            rest = [raw.split(" ", 1)[1]] if " " in raw else []
+
+        args, why = input_args(verb, rest)
+
+        if not args:
+            say({"event": "error", "cmd": verb, "error": why})
+            return False
+
+        ok, out_text, err = shell(device, *args, timeout=15)
+
+        if not ok:
+            say({"event": "error", "cmd": verb, "error": err or (out_text or "").strip()})
+
+        return verb in AFTER_SHOT
+
+    say({
+        "event": "ready",
+        "device": device["name"] or device["serial"],
+        "serial": device["serial"],
+        "fps": round(1.0 / state["interval"], 2),
+        "folder": folder,
+    })
+
+    # Una prima fotografia comunque, anche da fermi: chi apre la finestra vuole
+    # vedere lo schermo, e «Segui» spento vuol dire "non continuare", non
+    # "non cominciare".
+    alive = capture()
+    due = time.monotonic() + state["interval"]
+
+    # Chi chiude la finestra chiude il processo, e senza questo il segnale
+    # arriverebbe senza passare dal `finally`: i due PNG resterebbero li' e
+    # alla riapertura si vedrebbe per un istante lo schermo di prima.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    try:
+        while alive:
+            now = time.monotonic()
+
+            # In pausa non c'e' nessun turno da aspettare: si dorme sullo stdin
+            # finche' non arriva qualcosa da fare. E' lo stato in cui la
+            # finestra sta con «Segui» spento, e deve costare zero.
+            wait = None if state["paused"] else max(0.0, due - now)
+            ready = select.select([sys.stdin], [], [], wait)[0]
+
+            if ready:
+                line = sys.stdin.readline()
+
+                if not line:
+                    # stdin chiuso: dall'altra parte non c'e' piu' nessuno.
+                    break
+
+                parts = line.strip().split()
+
+                if parts:
+                    verb = parts[0].lower()
+
+                    if verb == "quit":
+                        break
+
+                    if act(verb, parts[1:], line.strip()):
+                        alive = capture()
+                        due = time.monotonic() + state["interval"]
+
+                continue
+
+            if not state["paused"]:
+                alive = capture()
+                due = time.monotonic() + state["interval"]
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        # I due file non servono a nessuno appena la finestra si chiude, e
+        # lasciarli vorrebbe dire che alla prossima apertura si vede per un
+        # istante lo schermo di ieri.
+        for leftover in slots + [s + ".tmp" for s in slots]:
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
+
+    return {
+        "ok": state["misses"] < LIVE_GIVE_UP,
+        "frames": state["frame"],
+        "error": "" if state["misses"] < LIVE_GIVE_UP else (
+            "il telefono ha smesso di rispondere agli scatti"
+        ),
+    }
+
+
+def do_mirror(target="", mouse="uhid"):
+    """Apre scrcpy sul telefono scelto e torna subito.
+
+    Qui non si duplica quello che scrcpy fa gia': si sceglie il telefono con le
+    stesse regole di tutti gli altri comandi e gli si passa il serial. Il
+    processo parte in una sessione sua perche' deve sopravvivere a chi lo ha
+    lanciato — la dashboard si chiude, il mirroring no.
+
+    E' l'unica strada per i gesti a due dita: `input` ha un dito solo, e
+    scrivere su /dev/input lo vieta SELinux anche allo shell di adb. scrcpy ha
+    un pezzo suo sul telefono che inietta gli eventi dall'interno, ed e' quello
+    che qui non si puo' rifare.
+
+    Il mouse parte in modalita' uhid, che non e' un dettaglio: con --mouse=sdk
+    scrcpy inietta i click via API e il telefono non si accorge di avere un
+    mouse, mentre uhid gli monta un mouse HID vero col modulo UHID del kernel.
+    Da quel momento esiste un cursore, che resta dov'e' quando il click e'
+    finito, ed e' quello che `pointer` sa leggere. Il prezzo e' che la finestra
+    di scrcpy si prende il mouse del PC e lo muove in relativo: LAlt o Super lo
+    restituiscono. Chi preferisce il vecchio comportamento passa --mouse=sdk.
+    """
+    view = devices_view(discover=False)
+    device, why = pick(view, target)
+
+    if not device:
+        return {"ok": False, "error": why}
+
+    if not SCRCPY:
+        return {"ok": False, "error": NO_SCRCPY}
+
+    name = device["name"] or device["serial"]
+
+    try:
+        subprocess.Popen(
+            [SCRCPY, "-s", device["serial"], "--window-title", name,
+             "--mouse=" + mouse],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+
+    return {
+        "ok": True,
+        "device": name,
+        "mouse": mouse,
+        "note": (
+            "scrcpy aperto in una finestra a parte"
+            if mouse != "uhid" else
+            "scrcpy aperto in una finestra a parte, con un mouse HID: muovilo "
+            "una volta e `pointer` sa dire dov'e' il cursore"
+        ),
     }
 
 
@@ -927,6 +1778,15 @@ def hierarchy(device):
             shell(device, "shell", "rm", "-f", remote, timeout=15)
 
     if "<hierarchy" not in raw:
+        # Su uno schermo spento uiautomator risponde «could not get idle
+        # state», che dice cosa non ha funzionato e non cosa fare. La domanda
+        # vera e' se ci fosse qualcosa da leggere, e la si paga solo qui.
+        if awake(device) is False:
+            return None, (
+                "lo schermo e' spento: accendilo con `display on`, o con "
+                "`unlock` se c'e' il PIN, e richiedi la schermata"
+            )
+
         return None, (err or "").strip() or "la schermata non e' leggibile"
 
     # uiautomator premette la sua riga di conferma e a volte lascia code dopo
@@ -1119,11 +1979,79 @@ def do_tap_text(label, target="", index=None):
     }
 
 
-def do_screenshot(path="", target=""):
-    """Salva uno screenshot PNG e restituisce il percorso.
+# Il cursore del mouse non e' una finestra e non sta nell'albero di
+# accessibilita': e' uno sprite che SurfaceFlinger disegna sopra tutto, e la
+# sua posizione la si legge solo di li'. Il nome del layer e' sempre «Sprite»,
+# il numero cambia a ogni sessione.
+#
+# La riga completa e' lunga un centinaio di campi, e il dump intero passa i
+# cinquemila righe: il grep sta sul telefono apposta, e quello che attraversa
+# la rete e' una manciata di righe. Sono 130 ms contro qualche secondo.
+SPRITE_DUMP = "dumpsys SurfaceFlinger | grep -A4 'Layer (Sprite'"
 
-    `exec-out` e non `shell`: quest'ultimo passa da uno pty che sostituisce i
-    ritorni a capo e consegna un PNG corrotto, un classico di adb.
+SPRITE_AT = re.compile(
+    r"layerStack=\s*(\d+),.*?pos=\(\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\)"
+)
+
+
+def sprites(dump):
+    """I cursori disegnati adesso, uno per blocco «+ Layer (Sprite…)».
+
+    Ce n'e' piu' d'uno quando lo schermo e' clonato su un display virtuale, e
+    quando «Mostra tocchi» e' acceso: anche i cerchietti sotto le dita sono
+    sprite. Il chiamante sceglie, qui si legge e basta.
+    """
+    found = []
+
+    for block in dump.split("+ Layer (Sprite")[1:]:
+        where = SPRITE_AT.search(block)
+
+        if not where:
+            continue
+
+        found.append({
+            "display": int(where.group(1)),
+            # Interi: servono a essere ripassati a `tap`, che vuole pixel.
+            "x": round(float(where.group(2))),
+            "y": round(float(where.group(3))),
+        })
+
+    return found
+
+
+def mouse_attached(device):
+    """Se il telefono vede un mouse, e se il suo cursore e' gia' comparso.
+
+    Due domande in una lettura sola perche' servono insieme: senza mouse non
+    c'e' niente da cercare, e con il mouse appena collegato il cursore esiste
+    ma non e' ancora stato disegnato da nessuna parte.
+    """
+    ok, out, _ = shell(device, "shell", "dumpsys", "input")
+
+    if not ok:
+        return False, False
+
+    dump = out or ""
+
+    # Ogni device dichiara le sue sorgenti; un mouse dice MOUSE. Il puntatore
+    # passa a POINTER da SPOT la prima volta che il mouse si muove davvero.
+    return (
+        bool(re.search(r"Sources:.*MOUSE", dump)),
+        "Presentation: POINTER" in dump,
+    )
+
+
+def do_pointer(target=""):
+    """Dove sta adesso il cursore del mouse, in pixel dello schermo.
+
+    Un dito non lascia coordinate: Android tiene la posizione del tocco finche'
+    il dito e' appoggiato e poi la butta — `dumpsys input` risponde «no
+    displays touched» un istante dopo. Un cursore invece resta dov'e', ma
+    esiste solo se al telefono e' collegato un mouse: uno vero via USB o
+    Bluetooth, oppure quello finto che scrcpy crea con --mouse=uhid, che e' il
+    modo in cui `mirror` apre il mirroring.
+
+    Quello che torna di qui va passato di peso a `tap`.
     """
     view = devices_view(discover=False)
     device, why = pick(view, target)
@@ -1131,10 +2059,153 @@ def do_screenshot(path="", target=""):
     if not device:
         return {"ok": False, "error": why}
 
-    ok, data, err = shell(device, "exec-out", "screencap", "-p", binary=True, timeout=60)
+    ok, out, err = shell(device, "shell", SPRITE_DUMP)
+
+    if not ok:
+        return {"ok": False, "error": err or "SurfaceFlinger non ha risposto"}
+
+    found = sprites(out or "")
+
+    if found:
+        # Il display 0 e' quello fisico; gli altri sono cloni, e un clone
+        # ripete il cursore del display che sta specchiando.
+        found.sort(key=lambda s: s["display"])
+        here = found[0]
+
+        return {
+            "ok": True,
+            "device": device["name"] or device["serial"],
+            "x": here["x"],
+            "y": here["y"],
+            "display": here["display"],
+            "source": "mouse",
+            "note": "cursore del mouse: il dito e i tap di adb non lo spostano",
+        }
+
+    # Da qui in giu' si paga un secondo dumpsys, ma solo quando c'e' da
+    # spiegare un'assenza — ed e' li' che una risposta vuota fa perdere tempo.
+    seen, moved = mouse_attached(device)
+
+    if not seen:
+        return {
+            "ok": False,
+            "device": device["name"] or device["serial"],
+            "error": "nessun mouse collegato al telefono, quindi nessun cursore",
+            "hint": (
+                "apri il mirroring con `mirror` e muovi il mouse dentro quella "
+                "finestra: il mouse finto nasce quando scrcpy lo cattura, non "
+                "quando parte. Oppure attacca un mouse USB o Bluetooth"
+            ),
+        }
+
+    return {
+        "ok": False,
+        "device": device["name"] or device["serial"],
+        "error": "c'e' un mouse ma il suo cursore non e' sullo schermo",
+        "hint": (
+            "muovilo una volta e il cursore compare"
+            if not moved else
+            "il cursore si nasconde da solo dopo un po': muovilo di nuovo"
+        ),
+    }
+
+
+# Il formato dei pixel che screencap dichiara nell'intestazione: 1 e'
+# RGBA_8888, l'unico che si sa reimpacchettare qui. Gli altri esistono (RGB_565
+# sui telefoni vecchi) e per quelli si torna al PNG fatto dal telefono, che li
+# conosce tutti.
+RGBA_8888 = 1
+
+
+def raw_to_png(raw, level=1):
+    """Il buffer di `screencap` senza opzioni, richiuso in un PNG qui.
+
+    Vale la pena perche' e' piu' svelto. Comprimere in PNG lo fa il telefono
+    con la sua CPU, e su uno sfondo fotografico ci mette un secondo e mezzo;
+    mandare i pixel come sono, con un gzip di passaggio, costa 0,8 s in tutto —
+    35 ms dei quali sono questa funzione, che gira su una CPU che ha altro da
+    dare. Sotto, la mezza dozzina di righe che un PNG richiede: intestazione,
+    un byte di filtro davanti a ogni riga, e zlib.
+
+    L'intestazione di screencap e' larghezza, altezza e formato in little
+    endian, seguiti su Android recenti dallo spazio colore: invece di
+    indovinare quanto e' lunga la si deduce da quanto avanza dopo i pixel.
+    """
+    if len(raw) < 16:
+        return b"", "il buffer dello schermo e' arrivato troppo corto"
+
+    width, height, fmt = struct.unpack("<III", raw[:12])
+    offset = len(raw) - width * height * 4
+
+    if fmt != RGBA_8888 or width <= 0 or height <= 0 or offset not in (12, 16):
+        return b"", f"schermo in un formato che non so richiudere ({width}x{height}, tipo {fmt})"
+
+    pixels = raw[offset:]
+    stride = width * 4
+    rows = bytearray()
+
+    for y in range(height):
+        rows.append(0)
+        rows += pixels[y * stride:(y + 1) * stride]
+
+    def chunk(tag, payload):
+        body = tag + payload
+        return struct.pack(">I", len(payload)) + body + struct.pack(">I", zlib.crc32(body))
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(bytes(rows), level))
+        + chunk(b"IEND", b"")
+    ), ""
+
+
+def grab_raw(device, timeout=60):
+    """I pixel nudi, compressi dal telefono con gzip e ricuciti qui.
+
+    Il gzip di mezzo non e' una finezza: i pixel nudi sono 4,6 MB a frame, e
+    farli passare per la rete due volte al secondo occuperebbe il Wi-Fi per
+    intero. Compressi sono 1,7 MB e il tempo e' lo stesso.
+    """
+    ok, data, err = shell(
+        device, "exec-out", "screencap | toybox gzip -1", binary=True, timeout=timeout,
+    )
 
     if not ok or not data:
-        return {"ok": False, "error": err or "screencap non ha prodotto niente"}
+        return b"", err or "screencap non ha prodotto niente"
+
+    try:
+        raw = zlib.decompress(data, 31)
+    except zlib.error as exc:
+        return b"", str(exc)
+
+    return raw_to_png(raw)
+
+
+def grab(device, timeout=60, raw=True):
+    """I byte PNG dello schermo, o la ragione per cui non ci sono.
+
+    `exec-out` e non `shell`: quest'ultimo passa da uno pty che sostituisce i
+    ritorni a capo e consegna un PNG corrotto, un classico di adb.
+
+    Sta per conto suo perche' la usano in due: lo scatto singolo, che la salva
+    dove gli e' stato chiesto, e la sessione `live`, che la ripete due volte al
+    secondo. Il controllo dell'immagine troncata deve restare uno solo.
+
+    Torna anche da quale delle due strade e' passata: chi ripete la cattura ha
+    bisogno di sapere se la piu' veloce ha funzionato, per non ritentarla a
+    ogni frame su un telefono che non la sa fare.
+    """
+    if raw:
+        data, why = grab_raw(device, timeout=timeout)
+
+        if data:
+            return data, "", True
+
+    ok, data, err = shell(device, "exec-out", "screencap", "-p", binary=True, timeout=timeout)
+
+    if not ok or not data:
+        return b"", err or "screencap non ha prodotto niente", False
 
     # Un PNG finisce con il chunk IEND: quattro byte di lunghezza a zero, il
     # nome, e il CRC. Guardare solo l'intestazione non basta — una sessione che
@@ -1142,13 +2213,41 @@ def do_screenshot(path="", target=""):
     # finisce, e chi lo apre dopo si trova un errore di decodifica al posto di
     # una spiegazione.
     if not data.startswith(b"\x89PNG") or not data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82"):
-        return {
-            "ok": False,
-            "error": "l'immagine e' arrivata incompleta: il collegamento si e' "
-                     "interrotto a meta' — riprova, e se insiste stacca e "
-                     "riattacca il cavo",
-            "bytes": len(data),
-        }
+        return b"", (
+            "l'immagine e' arrivata incompleta: il collegamento si e' "
+            "interrotto a meta' — riprova, e se insiste stacca e riattacca "
+            "il cavo"
+        ), False
+
+    return data, "", False
+
+
+def png_size(data):
+    """Larghezza e altezza lette dall'intestazione del PNG.
+
+    Sono nei byte 16..24, subito dopo la firma e il nome del chunk IHDR. Si
+    leggono qui invece di chiedere `wm size` al telefono perche' l'immagine sa
+    gia' quanto e' grande, e perche' un telefono ruotato la cambia senza
+    avvisare nessuno.
+    """
+    if len(data) < 24:
+        return 0, 0
+
+    return struct.unpack(">II", data[16:24])
+
+
+def do_screenshot(path="", target=""):
+    """Salva uno screenshot PNG e restituisce il percorso."""
+    view = devices_view(discover=False)
+    device, why = pick(view, target)
+
+    if not device:
+        return {"ok": False, "error": why}
+
+    data, why, _ = grab(device)
+
+    if not data:
+        return {"ok": False, "error": why}
 
     if not path:
         name = (device["name"] or "phone").replace(" ", "-")
@@ -1469,12 +2568,365 @@ def do_aim(mode="macro", target=""):
     }
 
 
-def do_status():
-    """Chi c'e', come e cosa manca perche' sia utilizzabile."""
+# -------------------------------------------------------------- healthbridge
+
+# L'app che legge Health Connect: sta in un progetto a parte, qui se ne
+# conoscono solo il nome e il punto d'ingresso. Come MacroCam non e' una
+# dipendenza — se non c'e', tutto il resto continua a funzionare e questo lo
+# dice.
+HEALTH = "com.oberon.healthbridge"
+HEALTH_FILES = "/sdcard/Android/data/%s/files" % HEALTH
+
+HEALTH_READS = [
+    "READ_HEART_RATE", "READ_STEPS", "READ_SLEEP", "READ_DISTANCE",
+    "READ_TOTAL_CALORIES_BURNED", "READ_ACTIVE_CALORIES_BURNED",
+    "READ_SKIN_TEMPERATURE", "READ_OXYGEN_SATURATION", "READ_WEIGHT",
+    "READ_HEALTH_DATA_IN_BACKGROUND",
+]
+
+HEALTH_MISSING = (
+    "HealthBridge non e' installata su questo telefono. Dal progetto "
+    "~/Documents/Development/Android/healthbridge: `./gradlew assembleDebug`, "
+    "poi `adb -s SERIAL install -r app/build/outputs/apk/debug/app-debug.apk` e "
+    "`phone_adb.py health-grant`"
+)
+
+
+# Un telefono che adb elenca non e' un telefono che risponde: una sessione
+# wireless stantia resta scritta in `adb devices` come "device" e fallisce a
+# ogni comando con "error: closed". La differenza conta proprio qui, perche' un
+# `pm list packages` che non arriva torna vuoto esattamente come quello di un
+# telefono senza l'app — e mandare a ricompilare un APK per un debug wireless
+# spento e' il genere di consiglio che fa perdere un pomeriggio.
+HEALTH_UNREACHABLE = (
+    "«%s» non risponde ad adb: la sessione e' caduta. Riaccendi il debug "
+    "wireless sul telefono (Opzioni sviluppatore → Debug wireless), poi apri la "
+    "sua finestra e premi Collega"
+)
+
+
+def health_probe(device):
+    """(l'app c'e', perche' non si sa). Le due cose non si deducono l'una dall'altra."""
+    ok, out, err = shell(device, "shell", "pm", "list", "packages", HEALTH)
+
+    if not ok:
+        return False, HEALTH_UNREACHABLE % (device["name"] or device["serial"])
+
+    return HEALTH in (out or ""), ""
+
+
+def health_status(device):
+    ok, out, _ = shell(device, "shell", "cat", HEALTH_FILES + "/status.json")
+
+    if not ok or not out:
+        return None
+
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+# `am broadcast` stampa il risultato del receiver su una riga sua, fra
+# virgolette che non protegge: il JSON dentro ha le proprie e nessuno le
+# raddoppia, quindi non si puo' cercare la prima virgoletta di chiusura — si
+# prende tutto fino all'ultima.
+BROADCAST_DATA = 'data="'
+
+
+def broadcast_payload(out):
+    """Il JSON dentro la risposta di `am broadcast`, se c'e'."""
+    where = (out or "").find(BROADCAST_DATA)
+
+    if where < 0:
+        return None
+
+    raw = out[where + len(BROADCAST_DATA):].strip()
+
+    if raw.endswith('"'):
+        raw = raw[:-1]
+
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return None
+
+
+def health_ask(device, action, extras=(), timeout=45):
+    """Una domanda all'app e la sua risposta.
+
+    Passa da un broadcast e non da `am start` perche' un receiver non e'
+    un'activity: non entra nella pila delle applicazioni, non prende il fuoco e
+    non ha niente a che vedere con cio' che c'e' a schermo — l'app che si sta
+    usando resta dov'e', e il telefono addormentato resta addormentato. In piu'
+    `am broadcast` riporta il risultato al chiamante, mentre `am start` non
+    riporta niente: e' quello che fa sparire la danza del contatore e del file
+    riletto finche' il numero non cambia.
+
+    L'activity resta come ripiego, per le due volte in cui serve: una lettura
+    piu' lunga di quanto un receiver possa vivere — oltre la decina di secondi
+    Android lo chiude — e il sospetto che sia il receiver stesso a non
+    rispondere. Li' si torna a guardare `status.json`, che l'app scrive
+    comunque.
+
+    Una lettura costa cinque o sei secondi, quasi tutti spesi a collegarsi a
+    Health Connect: non dipende da quanti minuti si chiedono.
+    """
+    args = [
+        "shell", "am", "broadcast",
+        "-a", HEALTH + ".READ", "-n", HEALTH + "/.ReadReceiver",
+        "--es", "action", action,
+    ]
+
+    for key, value in extras:
+        args += ["--es", key, str(value)]
+
+    ok, out, err = shell(device, *args, timeout=timeout)
+    status = broadcast_payload(out) if ok else None
+
+    if status is None:
+        return health_ask_slowly(device, action, extras, timeout, err or "")
+
+    if status.get("state") != "ok":
+        return None, status.get("error") or "la lettura e' fallita"
+
+    return status, ""
+
+
+def health_ask_slowly(device, action, extras, timeout, why):
+    """La stessa domanda per la via lunga: l'activity, e il file riletto.
+
+    `am start` non aspetta la fine di niente e non restituisce niente, quindi
+    si legge il contatore prima, si lancia, e si guarda il file finche' il
+    numero non e' cambiato — la stessa danza di `do_photo`.
+    """
+    before = (health_status(device) or {}).get("seq", 0)
+
+    args = ["shell", "am", "start", "-n", HEALTH + "/.ReadActivity", "--es", "action", action]
+
+    for key, value in extras:
+        args += ["--es", key, str(value)]
+
+    started, _, err = shell(device, *args, timeout=30)
+
+    if not started:
+        return None, (why or err or "l'app non ha risposto")
+
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        fresh = health_status(device)
+
+        if fresh and fresh.get("seq", 0) > before and fresh.get("state") != "busy":
+            if fresh.get("state") != "ok":
+                return None, fresh.get("error") or "la lettura e' fallita"
+
+            return fresh, ""
+
+        time.sleep(0.4)
+
+    return None, "la lettura non ha risposto entro %d secondi" % timeout
+
+
+def health_open(target):
+    """Il telefono scelto, gia' controllato che abbia l'app: lo fanno in cinque.
+
+    Il secondo valore e' la risposta d'errore gia' pronta, non il solo motivo:
+    quando i telefoni collegati sono piu' d'uno serve portarsi dietro anche i
+    loro nomi, perche' chi chiede possa farne dei pulsanti invece di stampare
+    una parentesi in fondo a una frase che dice di usare `--device`.
+    """
+    view = devices_view(discover=False)
+    device, why = pick(view, target)
+
+    if not device:
+        problem = {"ok": False, "error": why}
+        names = [d["name"] or d["serial"] for d in view if d["connected"]]
+
+        if not target and len(names) > 1:
+            problem["choices"] = names
+
+        return None, problem
+
+    installed, why = health_probe(device)
+
+    if not installed:
+        return None, {"ok": False, "error": why or HEALTH_MISSING}
+
+    return device, {}
+
+
+def do_heart(target="", minutes=60, bucket=60, raw=False):
+    """Il battito degli ultimi minuti, un punto per intervallo.
+
+    I buchi si aprono qui e non sull'app: Health Connect restituisce solo gli
+    intervalli che hanno campioni, il che e' giusto — ma chi disegna vuole una
+    griglia regolare in cui un minuto senza dati sia `None` e non un punto che
+    non c'e'. Senza, la linea salterebbe il buco unendo i due estremi, e mezz'ora
+    col braccialetto sul comodino sembrerebbe mezz'ora di battito.
+    """
+    device, problem = health_open(target)
+
+    if not device:
+        return problem
+
+    extras = [("minutes", minutes), ("bucket", bucket)]
+
+    if raw:
+        extras.append(("raw", "on"))
+
+    status, err = health_ask(device, "heart", extras)
+
+    if not status:
+        return {"ok": False, "error": err}
+
+    out = {
+        "ok": True,
+        "device": device["name"] or device["serial"],
+        "minutes": minutes,
+        "now": status.get("now"),
+        "latest": status.get("latest"),
+        "lag_seconds": status.get("lagSeconds"),
+    }
+
+    if raw:
+        out["samples"] = status.get("samples") or []
+        out["count"] = status.get("count", 0)
+        return out
+
+    have = {int(b[0]): b for b in (status.get("buckets") or [])}
+    now = status.get("now") or int(time.time())
+    step = bucket
+    first = now - minutes * 60
+
+    # La griglia si allinea al passo, se no due letture di fila cadrebbero su
+    # istanti diversi e gli stessi minuti non si sovrapporrebbero mai.
+    first -= first % step
+    points = []
+
+    for at in range(first, now + 1, step):
+        found = have.get(at)
+        points.append(
+            {"t": at, "avg": found[1], "min": found[2], "max": found[3]}
+            if found else {"t": at, "avg": None, "min": None, "max": None}
+        )
+
+    out["bucket_seconds"] = bucket
+    out["count"] = len(have)
+    out["gaps"] = len(points) - len(have)
+    out["points"] = points
+
+    return out
+
+
+def do_today(target=""):
+    """Passi, calorie, sonno e il resto della giornata, come li ha Health Connect."""
+    device, problem = health_open(target)
+
+    if not device:
+        return problem
+
+    status, err = health_ask(device, "today")
+
+    if not status:
+        return {"ok": False, "error": err}
+
+    out = {"ok": True, "device": device["name"] or device["serial"]}
+
+    for key in (
+        "now", "since", "steps", "distanceMeters", "calories", "activeCalories",
+        "bpmAvg", "bpmMin", "bpmMax", "sleep", "skinTemperature", "oxygen", "weight",
+    ):
+        out[key] = status.get(key)
+
+    return out
+
+
+def do_vitals(target=""):
+    """Cosa c'e' dentro Health Connect e quanto e' fresco, tipo per tipo.
+
+    Serve a rispondere alla sola domanda che conta quando qualcosa non torna:
+    il dato non c'e' perche' l'app ponte non lo sa leggere, o perche' Fitbit non
+    lo ha mai scritto? La riga `origins` dice chi lo ha messo li'.
+    """
+    device, problem = health_open(target)
+
+    if not device:
+        return problem
+
+    status, err = health_ask(device, "probe")
+
+    if not status:
+        return {"ok": False, "error": err}
+
+    return {
+        "ok": True,
+        "device": device["name"] or device["serial"],
+        "sdk": status.get("sdk"),
+        "now": status.get("now"),
+        "granted": status.get("granted"),
+        "missing": status.get("missing"),
+        "types": status.get("types"),
+    }
+
+
+def do_health_grant(target=""):
+    """I permessi di lettura all'app ponte, uno per uno.
+
+    Su questo telefono `pm grant` basta: i permessi health sono `dangerous` ma
+    non ristretti. Dove non bastasse, la strada e' quella di MacroCam — aprire
+    l'app e toccare il dialogo con `tap-text` — e il suggerimento lo dice.
+    """
+    device, problem = health_open(target)
+
+    if not device:
+        return problem
+
+    done, failed = [], {}
+
+    for name in HEALTH_READS:
+        ok, out, err = shell(
+            device, "shell", "pm", "grant", HEALTH, "android.permission.health." + name,
+        )
+        trouble = (err or out or "").strip()
+
+        if ok and not trouble:
+            done.append(name)
+        else:
+            failed[name] = trouble or "rifiutato"
+
+    return {
+        "ok": not failed,
+        "device": device["name"] or device["serial"],
+        "granted": done,
+        "failed": failed,
+        "hint": "" if not failed else (
+            "questi vanno concessi a mano: `launch %s`, poi `screen` per "
+            "leggere le etichette e `tap-text` per toccarle" % HEALTH
+        ),
+    }
+
+
+def do_status(quick=False):
+    """Chi c'e', come e cosa manca perche' sia utilizzabile.
+
+    Con `quick` non si ascolta la rete: si guarda solo cosa ha adb adesso e chi
+    conosce KDE Connect. Trecento millisecondi invece di tre secondi, e serve a
+    chi vuole sapere se il telefono risponde — non a chi deve ancora entrarci.
+    E' la domanda del pannello, che la rifa' ogni trenta secondi: pagare li'
+    l'ascolto mDNS vorrebbe dire tenere occupato un processo un decimo del
+    tempo per un pallino colorato.
+
+    Quello che si perde e' il debug wireless annunciato e la finestra del
+    codice: senza ascolto non si sa se ci sono, e "non annunciato" e "non lo
+    so" sono due cose diverse. Per questo la risposta porta `discovered`, e i
+    suggerimenti che dipendono dall'annuncio restano fuori invece di essere
+    dati per falsi.
+    """
     if not ADB:
         return {"ok": False, "error": NO_ADB}
 
-    view = devices_view()
+    view = devices_view(discover=not quick)
 
     hints = []
 
@@ -1485,7 +2937,10 @@ def do_status():
         who = device["name"] or device["ip"] or device["serial"]
 
         if device["adb"] == "unauthorized":
-            hints.append(f"{who}: conferma la chiave RSA sullo schermo del telefono")
+            hints.append(
+                f"{who}: conferma la chiave RSA sullo schermo del telefono "
+                "(se la finestra non c'e' piu', `repair` la fa ricomparire)"
+            )
         elif device["adb"] == "offline":
             # Il telefono e' attaccato ma la sessione e' morta. Qui si e' gia'
             # provato `adb reconnect` una volta: se e' ancora offline serve una
@@ -1495,20 +2950,44 @@ def do_status():
                 f"{who}: collegamento offline — stacca e riattacca il cavo, "
                 "oppure prova un'altra porta USB"
             )
+        elif quick:
+            # Da qui in giu' ogni ramo parla di cosa il telefono sta
+            # annunciando, e con `quick` nessuno ha ascoltato.
+            continue
         elif device["pairing_open"]:
             hints.append(f"{who}: sta chiedendo il codice — lancia `pair <codice>`")
         elif device["wireless_debugging"]:
             hints.append(f"{who}: debug wireless acceso, basta `connect`")
+        elif device["paired"]:
+            hints.append(
+                f"{who}: gia' accoppiato — il pairing non va rifatto, ma adesso "
+                "non annuncia il debug wireless: accendigli lo schermo, e se "
+                "serve riaccendi Opzioni sviluppatore → Debug wireless. Se e' "
+                "il telefono ad aver dimenticato questo PC, `repair`"
+            )
         elif device["ip"]:
             hints.append(
                 f"{who}: debug wireless spento (Opzioni sviluppatore → Debug wireless)"
             )
 
+    # Un percorso scritto a mano in tools.json e sbagliato si e' gia' fatto
+    # sostituire dal PATH, senza rompere niente: qui e' il primo posto in cui
+    # c'e' qualcuno che legge, ed e' l'unico modo di scoprirlo prima di
+    # chiedersi per mezz'ora perche' il binario scelto non viene usato.
+    hints += tools.trouble()
+
     return {
         "ok": True,
         "devices": view,
         "connected": [d["name"] or d["serial"] for d in view if d["connected"]],
+        # Se qualcuno ha ascoltato la rete in questo giro. Quando e' falso,
+        # `wireless_debugging` e `pairing_open` valgono "non lo so", non "no".
+        "discovered": not quick,
         "mdns": bool(AVAHI),
+        # Non e' una capacita' del telefono ma di questa macchina: il pannello
+        # ci disegna sopra un pulsante, e senza saperlo lo disegnerebbe acceso
+        # per poi fallire al clic.
+        "mirror": bool(SCRCPY),
         "hints": hints,
         "note": "" if AVAHI else NO_AVAHI,
     }
@@ -1522,9 +3001,23 @@ def main():
     parser.add_argument("--device", default="", help="nome, indirizzo o serial del telefono")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("status", help="telefoni, stato adb e cosa manca")
+    status = sub.add_parser("status", help="telefoni, stato adb e cosa manca")
+    status.add_argument("--quick", action="store_true",
+                        help="senza ascolto mDNS: solo cosa ha adb adesso")
     sub.add_parser("connect", help="collega ad adb chi e' raggiungibile")
     sub.add_parser("disconnect", help="stacca la connessione wireless")
+    sub.add_parser("forget", help="dimentica le porte salvate")
+    sub.add_parser("repair", help="rimette in gioco un telefono che ha tolto l'autorizzazione")
+    mirror = sub.add_parser("mirror", help="apre scrcpy sul telefono")
+    mirror.add_argument("--mouse", default="uhid", choices=["uhid", "sdk", "aoa"],
+                        help="come mandare il mouse: uhid monta un mouse HID "
+                             "vero (e da' un cursore leggibile con pointer)")
+
+    live = sub.add_parser("live", help="sessione: frame su stdout, comandi su stdin")
+    live.add_argument("--fps", type=float, default=2.0, help="scatti al secondo")
+    live.add_argument("--out", default="", help="dove posare i frame")
+    live.add_argument("--paused", action="store_true",
+                      help="parte fermo: uno scatto e poi si aspettano i comandi")
 
     pair = sub.add_parser("pair", help="accoppia col codice a sei cifre")
     pair.add_argument("code")
@@ -1553,6 +3046,8 @@ def main():
 
     key = sub.add_parser("key", help="preme un tasto: HOME, BACK, POWER…")
     key.add_argument("values", nargs=1)
+
+    sub.add_parser("pointer", help="dov'e' adesso il cursore del mouse")
 
     screen = sub.add_parser("screen", help="il testo sullo schermo, con dove toccarlo")
     screen.add_argument("--query", default="", help="solo gli elementi che contengono questo")
@@ -1588,15 +3083,35 @@ def main():
     aim = sub.add_parser("aim", help="apre il mirino sul telefono per scegliere l'area")
     aim.add_argument("--mode", default="macro", choices=["normal", "macro"])
 
+    heart = sub.add_parser("heart", help="il battito degli ultimi minuti, da Health Connect")
+    heart.add_argument("--minutes", type=int, default=60)
+    heart.add_argument("--bucket", type=int, default=60, help="secondi per punto")
+    heart.add_argument("--raw", action="store_true", help="i campioni singoli, non le medie")
+
+    sub.add_parser("today", help="passi, calorie, sonno e il resto di oggi")
+    # `vitals` e non `health`: in questo progetto `health` e' gia' lo stato del
+    # sistema, e due nomi uguali per cose diverse sono un errore di lettura in
+    # attesa di succedere.
+    sub.add_parser("vitals", help="cosa c'e' in Health Connect e quanto e' fresco")
+    sub.add_parser("health-grant", help="concede i permessi di lettura all'app ponte")
+
     args = parser.parse_args()
     command = args.command or "status"
 
     if command == "status":
-        payload = do_status()
+        payload = do_status(getattr(args, "quick", False))
     elif command == "connect":
         payload = do_connect(args.device)
     elif command == "disconnect":
         payload = do_disconnect(args.device)
+    elif command == "forget":
+        payload = do_forget(args.device)
+    elif command == "repair":
+        payload = do_repair(args.device)
+    elif command == "mirror":
+        payload = do_mirror(args.device, args.mouse)
+    elif command == "live":
+        payload = do_live(args.device, args.fps, args.out, args.paused)
     elif command == "pair":
         payload = do_pair(args.code, args.device)
     elif command == "apps":
@@ -1607,6 +3122,8 @@ def main():
         payload = do_open(args.url, args.device)
     elif command == "screen":
         payload = do_screen(args.device, args.query)
+    elif command == "pointer":
+        payload = do_pointer(args.device)
     elif command == "tap-text":
         payload = do_tap_text(args.label, args.device, args.index)
     elif command in ("tap", "swipe", "text", "key"):
@@ -1635,6 +3152,14 @@ def main():
         )
     elif command == "aim":
         payload = do_aim(args.mode, args.device)
+    elif command == "heart":
+        payload = do_heart(args.device, args.minutes, args.bucket, args.raw)
+    elif command == "today":
+        payload = do_today(args.device)
+    elif command == "vitals":
+        payload = do_vitals(args.device)
+    elif command == "health-grant":
+        payload = do_health_grant(args.device)
     else:
         payload = {"ok": False, "error": f"comando sconosciuto: {command}"}
 

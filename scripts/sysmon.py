@@ -11,11 +11,14 @@ nomi, frequenze, sensori e informazioni energetiche differenti.
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import threading
 import time
+
+# I percorsi scritti in ~/.config/quickshell/tools.json vincono sul PATH:
+# vedi tools.py, che sta qui accanto.
+import tools
 
 
 # =============================================================================
@@ -63,7 +66,7 @@ try:
     BACKEND = "nvml"
 
 except Exception:
-    if shutil.which("nvidia-smi"):
+    if tools.which("nvidia-smi"):
         BACKEND = "smi"
 
 
@@ -1817,7 +1820,7 @@ def disks(prev, cur, dt):
 # SMART
 # =============================================================================
 
-SMARTCTL = shutil.which("smartctl")
+SMARTCTL = tools.which("smartctl")
 
 NVME_UNIT = 512 * 1000
 
@@ -2868,11 +2871,11 @@ def updates():
         "flatpak": 0,
         "samples": [],
         "packagekit": bool(
-            shutil.which("pkcon")
+            tools.which("pkcon")
         ),
     }
 
-    if shutil.which("dnf"):
+    if tools.which("dnf"):
         try:
             result = subprocess.run(
                 [
@@ -2912,7 +2915,7 @@ def updates():
                     )[0]
                 )
 
-    if shutil.which("flatpak"):
+    if tools.which("flatpak"):
         try:
             result = subprocess.run(
                 [

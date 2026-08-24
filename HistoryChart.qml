@@ -10,6 +10,12 @@ Item {
     property color lineColor: "#58a6ff"
     property int hours: 16
     property int decimals: 1
+    // Ampiezza verticale minima. Senza, una serie piatta riempie il grafico
+    // con il proprio rumore: un battito a riposo fra 58 e 62 disegnerebbe
+    // montagne alte quanto quelle di una corsa. E' l'idea del minScale di
+    // PowerChart, ma qui vale sull'intervallo e non sul fondoscala, perche'
+    // questo grafico non parte da zero. Zero = come si e' sempre comportato.
+    property real minSpan: 0
     // Le serie disegnate, per il selettore di colore: [{ id, label, fallback }].
     property var series: []
 
@@ -35,13 +41,27 @@ Item {
         if (!isFinite(min))
             return null;
         // Una serie piatta non deve diventare una divisione per zero.
-        return max - min < 1e-6 ? ({
-                    min: min - 0.5,
-                    max: max + 0.5
-                }) : ({
-                    min: min,
-                    max: max
-                });
+        if (max - min < 1e-6)
+            return {
+                min: min - 0.5,
+                max: max + 0.5
+            };
+
+        // L'ampiezza minima si aggiunge attorno al centro, non in cima: alzare
+        // solo il massimo spingerebbe la linea verso il basso invece di
+        // lasciarla dov'e'.
+        if (max - min < root.minSpan) {
+            const middle = (min + max) / 2;
+            return {
+                min: middle - root.minSpan / 2,
+                max: middle + root.minSpan / 2
+            };
+        }
+
+        return {
+            min: min,
+            max: max
+        };
     }
 
     readonly property bool hasData: range !== null
