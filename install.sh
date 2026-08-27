@@ -180,15 +180,22 @@ if [[ "${SKIP_COPY:-0}" -ne 1 ]]; then
         # rsync keeps the destination aligned with the source (settings live in
         # dashboard.json, outside of this folder).
         #
-        # panels/ is excluded on purpose, and it is the one exclusion that
-        # protects the user's own work rather than ours: --delete removes
-        # whatever is in the destination and not in the source, so without this
-        # line a reinstall would silently wipe every panel they had added.
+        # panels/ is excluded from this first pass on purpose: --delete removes
+        # whatever is in the destination and not in the source, so without the
+        # exclusion a reinstall would silently wipe every panel the user had
+        # added. The panels shipped with the dashboard live in that same folder
+        # now, so they are copied by the second pass right below — which never
+        # deletes.
         rsync -a --delete \
             --exclude '.git/' --exclude '.claude/' --exclude '__pycache__/' \
             --exclude '*.pyc' --exclude 'install.sh' --exclude '*.desktop' \
             --exclude 'panels/' \
             "$SOURCE_DIR"/ "$DEST"/
+        # Shipped panels: copy-in only. User-added files are left alone, and a
+        # panel modified in place is overwritten — it is part of the dashboard,
+        # not personal work; anything personal belongs in a file of its own.
+        mkdir -p "$DEST/panels"
+        rsync -a "$SOURCE_DIR/panels/" "$DEST/panels/"
     else
         # Fallback with cp.
         cp -a "$SOURCE_DIR"/. "$DEST"/
@@ -363,6 +370,7 @@ fi
 echo
 info "  Data configuration:       $CONFIG_ROOT/dashboard.json"
 info "  Home Assistant configuration: $CONFIG_ROOT/home-assistant.json"
+info "  MacroCam Web key (solar meter): $CONFIG_ROOT/macrocam.json"
 if [[ $DO_LAUNCHER -eq 1 ]]; then
     info "  Applications menu:       ${DESKTOP_FILE:-$HOME/.local/share/applications/dashboard-quickshell.desktop}"
 fi

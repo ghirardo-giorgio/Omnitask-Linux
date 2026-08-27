@@ -66,6 +66,96 @@ Item {
 
     readonly property bool hasData: range !== null
 
+    // Margine verticale, per non far toccare linea e bordi. Stava dentro il
+    // disegno; adesso e' qui perche' serve anche a posare il pallino sotto il
+    // puntatore esattamente sulla linea: due formule separate finirebbero
+    // prima o poi per non essere piu' la stessa.
+    readonly property real lo: root.hasData ? root.range.min - (root.range.max - root.range.min) * 0.12 : 0
+    readonly property real hi: root.hasData ? root.range.max + (root.range.max - root.range.min) * 0.12 : 1
+
+    // --- l'asse dei tempi ---------------------------------------------------
+    //
+    // Le etichette dicono l'ora dell'orologio, non quanto si e' indietro:
+    // «08:40» risponde alla domanda che ci si fa davanti a un grafico — quando
+    // e' successo — mentre «-4h» la lascia da calcolare. Tutti i grafici che
+    // usano questo componente finiscono adesso (lo storico di Home Assistant,
+    // il battito, il Fitbit), quindi l'estremo destro e' l'ora corrente e gli
+    // altri si ricavano indietro.
+    property real endTime: Date.now()
+
+    // Mezzo minuto: piu' fitto non si vedrebbe, piu' rado l'ultima etichetta
+    // comincerebbe a mentire di qualche minuto.
+    Timer {
+        interval: 30000
+        running: true
+        repeat: true
+        onTriggered: root.endTime = Date.now()
+    }
+
+    // L'ora del campione i-esimo. Il primo campione sta `hours` ore indietro,
+    // l'ultimo adesso, e in mezzo si divide in parti uguali.
+    function timeAt(index: int): var {
+        const n = root.values.length;
+        const back = n > 1 ? (n - 1 - index) / (n - 1) : 0;
+        return new Date(root.endTime - back * root.hours * 3600000);
+    }
+
+    function clockAt(index: int): string {
+        return Qt.formatTime(root.timeAt(index), "HH:mm");
+    }
+
+    // L'ora di un punto dell'asse, indicato per frazione della finestra: 0 e'
+    // il bordo sinistro, 1 adesso. Non passa per i campioni apposta — le
+    // etichette dell'asse devono dire la stessa cosa anche quando lo storico
+    // e' vuoto, dove un indice non c'e'.
+    function clockBack(fraction: real): string {
+        return Qt.formatTime(new Date(root.endTime - (1 - fraction) * root.hours * 3600000), "HH:mm");
+    }
+
+    // --- la lettura sotto il puntatore --------------------------------------
+    //
+    // Un grafico alto sessanta pixel non ha spazio per una scala fitta: il
+    // valore esatto di un punto si legge passandoci sopra, che e' anche il
+    // gesto con cui si cerca «quanto era, li'».
+    HoverHandler {
+        id: hover
+    }
+
+    readonly property bool valid: root.hasData && root.values.length > 1
+
+    // L'indice sotto il puntatore, gia' spostato sul campione valido piu'
+    // vicino: dentro un buco non c'e' niente da dire, ma un buco largo un
+    // campione non deve far sparire la lettura mentre si scorre.
+    readonly property int hoverIndex: {
+        if (!root.valid || !hover.hovered || canvas.width <= 0)
+            return -1;
+
+        const x = hover.point.position.x;
+
+        if (x < 0 || x > canvas.width)
+            return -1;
+
+        const n = root.values.length;
+        const centre = Math.max(0, Math.min(n - 1, Math.round(x / canvas.width * (n - 1))));
+
+        for (let d = 0; d <= 6; d++) {
+            const after = centre + d;
+            const before = centre - d;
+
+            if (after < n && root.values[after] !== null && isFinite(root.values[after]))
+                return after;
+
+            if (before >= 0 && root.values[before] !== null && isFinite(root.values[before]))
+                return before;
+        }
+
+        return -1;
+    }
+
+    readonly property real hoverValue: root.hoverIndex >= 0 ? root.values[root.hoverIndex] : 0
+    readonly property real hoverX: root.hoverIndex >= 0 && root.values.length > 1 ? root.hoverIndex / (root.values.length - 1) * canvas.width : 0
+    readonly property real hoverY: canvas.height - (root.hoverValue - root.lo) / (root.hi - root.lo) * canvas.height
+
     implicitHeight: 64
 
     onValuesChanged: canvas.requestPaint()
@@ -108,10 +198,8 @@ Item {
             if (!root.range || root.values.length < 2)
                 return;
 
-            // Margine verticale, per non far toccare linea e bordi.
-            const pad = (root.range.max - root.range.min) * 0.12;
-            const lo = root.range.min - pad;
-            const hi = root.range.max + pad;
+            const lo = root.lo;
+            const hi = root.hi;
 
             const xOf = i => i / (root.values.length - 1) * w;
             const yOf = v => h - (v - lo) / (hi - lo) * h;
@@ -196,28 +284,79 @@ Item {
         text: I18n.t("nessuno storico")
     }
 
-    // Riferimenti temporali.
+    // --- il puntatore --------------------------------------------------------
+    //
+    // Riga verticale e pallino: la riga dice dove si sta guardando, il pallino
+    // su quale valore. Sono elementi veri e non disegno sul Canvas, perche' un
+    // Canvas si ridipinge tutto a ogni movimento del mouse e questi due si
+    // spostano soltanto.
+    Rectangle {
+        visible: root.hoverIndex >= 0
+        x: Math.round(root.hoverX)
+        width: 1
+        height: canvas.height
+        color: Qt.alpha(root.lineColor, 0.45)
+    }
+
+    Rectangle {
+        visible: root.hoverIndex >= 0
+        x: root.hoverX - 3
+        y: root.hoverY - 3
+        width: 6
+        height: 6
+        radius: 3
+        color: root.lineColor
+        border.width: 1
+        border.color: "#0d1117"
+    }
+
+    // --- i riferimenti temporali ---------------------------------------------
+    //
+    // Tre ore lungo l'asse: dove comincia il grafico, la meta', e adesso.
+    // Mentre il mouse e' sopra lasciano il posto alla lettura del punto: la
+    // striscia e' alta nove pixel, e due scritte sovrapposte non le legge
+    // nessuno.
     Text {
         anchors.left: parent.left
         anchors.bottom: parent.bottom
+        visible: root.hoverIndex < 0
         color: "#484f58"
         font.pixelSize: 9
-        text: `-${root.hours}h`
+        text: root.clockBack(0)
     }
 
     Text {
         anchors.horizontalCenter: parent.horizontalCenter
         anchors.bottom: parent.bottom
+        visible: root.hoverIndex < 0
         color: "#484f58"
         font.pixelSize: 9
-        text: `-${Math.round(root.hours / 2)}h`
+        text: root.clockBack(0.5)
     }
 
     Text {
         anchors.right: parent.right
         anchors.bottom: parent.bottom
+        visible: root.hoverIndex < 0
         color: "#484f58"
         font.pixelSize: 9
+        // L'ultimo campione e' di adesso, e «ora» lo dice meglio dell'ora
+        // esatta: e' l'unico punto dell'asse che non serve andare a cercare.
         text: I18n.t("ora")
+    }
+
+    // La lettura del punto: quando, e quanto. Sta nella striscia sotto il
+    // grafico, sopra le etichette che si sono tolte di mezzo, e segue il
+    // puntatore restando dentro i bordi.
+    Text {
+        id: readout
+
+        anchors.bottom: parent.bottom
+        x: Math.max(0, Math.min(root.width - implicitWidth, root.hoverX - implicitWidth / 2))
+        visible: root.hoverIndex >= 0
+        font.pixelSize: 9
+        color: "#8b949e"
+        textFormat: Text.StyledText
+        text: root.hoverIndex < 0 ? "" : `${root.clockAt(root.hoverIndex)} · <font color="${root.lineColor}">${root.hoverValue.toFixed(root.decimals)}</font>`
     }
 }

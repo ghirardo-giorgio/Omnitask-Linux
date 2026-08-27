@@ -1,6 +1,11 @@
 import QtQuick
 import QtQuick.Layouts
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // Quanto tempo i processi passano fermi ad aspettare, invece di lavorare.
 //
 // Non e' l'utilizzo visto da un'altra angolazione: un disco al 100% che serve
@@ -9,6 +14,27 @@ import QtQuick.Layouts
 // lento" quando CPU e RAM sembrano a posto.
 ColumnLayout {
     id: root
+
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "pressure"
+    property string panelTitle: "Pressione"
+
+    // I valori che prima erano scritti nel codice e adesso stanno nel file
+    // di configurazione (sezione "panelParams" di dashboard.json): qui
+    // resta solo il default, che il pannello registra al primo avvio.
+    readonly property var defs: ({
+            warnPct: 1,
+            badPct: 10
+        })
+    // Soglie sulla media di un minuto: oltre `warnPct` il numero si accende,
+    // oltre `badPct` diventa rosso e in grassetto.
+    readonly property real warnPct: Settings.panelParam("pressure", "warnPct", defs.warnPct)
+    readonly property real badPct: Settings.panelParam("pressure", "badPct", defs.badPct)
+
+    Component.onCompleted: Settings.declarePanelParams("pressure", defs)
 
     // Il grafico mostra l'istante (ricavato dal contatore cumulativo, vedi
     // pressure() in sysmon.py), il numero a destra la media di un minuto: uno
@@ -77,11 +103,11 @@ ColumnLayout {
                 }
 
                 Text {
-                    // sotto l'uno per cento non c'e' niente da vedere: resta
+                    // sotto la prima soglia non c'e' niente da vedere: resta
                     // grigio, cosi' l'occhio si ferma solo dove serve
-                    color: row.modelData.avg >= 10 ? "#f85149" : row.modelData.avg >= 1 ? "#d29922" : "#6e7681"
+                    color: row.modelData.avg >= root.badPct ? "#f85149" : row.modelData.avg >= root.warnPct ? "#d29922" : "#6e7681"
                     font.pixelSize: 11
-                    font.bold: row.modelData.avg >= 1
+                    font.bold: row.modelData.avg >= root.warnPct
                     text: I18n.t("%1% nel minuto").arg(row.modelData.avg.toFixed(1))
                 }
             }

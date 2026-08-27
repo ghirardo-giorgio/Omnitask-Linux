@@ -18,6 +18,17 @@ Singleton {
     property bool online: false
     property string lastError: ""
 
+    // --- posizione di casa ---------------------------------------------------
+    // Latitudine e longitudine con cui Home Assistant fa i suoi conti: sono
+    // quelle dell'integrazione Sun, cosi' chi ricalcola il sole in proprio
+    // (il pannello Solare ne ricava gli orari di spostamento) parte dagli
+    // stessi numeri di sun.sun invece di chiedere le coordinate una seconda
+    // volta. Arrivano da /api/config, chiesta una volta per esecuzione: la
+    // posizione di casa non e' una misura che cambia mentre si guarda.
+    property real latitude: NaN
+    property real longitude: NaN
+    property bool locationFetched: false
+
     // --- storico -----------------------------------------------------------
     // Lo storico non viene accumulato dalla dashboard: lo tiene gia' il
     // recorder di Home Assistant, quindi i grafici sono completi anche al
@@ -29,9 +40,43 @@ Singleton {
 
     // entity_id -> array di historyPoints valori (null dove mancano dati).
     property var history: ({})
-    // Entita' di cui tenere lo storico: la imposta chi disegna i grafici.
+    // Entita' scelte nelle opzioni: la imposta il pannello Home Assistant, che
+    // ci tiene sopra un Binding (vedi HaPanel). Chi non e' quel pannello non
+    // deve scriverla — un Binding e' un padrone solo, e un secondo scrittore
+    // verrebbe scavalcato al primo cambio delle opzioni, in silenzio.
     property var historyEntities: []
-    onHistoryEntitiesChanged: root.refreshHistory(root.historyEntities)
+
+    // Le entita' chieste da un pannello per conto suo: l'igrometro vuole il
+    // proprio storico senza passare per l'elenco delle opzioni, e cosi' potra'
+    // fare qualunque altro pannello. Si aggiungono con watchHistory().
+    property var historyExtra: []
+
+    // Quelle di cui si scarica davvero lo storico: le due liste messe insieme,
+    // senza ripetizioni.
+    readonly property var historyWanted: {
+        const out = root.historyEntities.slice();
+        for (const id of root.historyExtra)
+            if (!out.includes(id))
+                out.push(id);
+        return out;
+    }
+
+    onHistoryWantedChanged: root.refreshHistory(root.historyWanted)
+
+    // Un pannello chiede lo storico di una sua entita' e, quando sparisce, lo
+    // lascia andare: senza il rilascio, spegnere un pannello continuerebbe a
+    // far scaricare la sua serie a ogni bucket, per sempre.
+    function watchHistory(entityId: string) {
+        if (!entityId || !entityId.length || root.historyExtra.includes(entityId))
+            return;
+        root.historyExtra = root.historyExtra.concat([entityId]);
+    }
+
+    function unwatchHistory(entityId: string) {
+        if (!root.historyExtra.includes(entityId))
+            return;
+        root.historyExtra = root.historyExtra.filter(x => x !== entityId);
+    }
 
     signal statesUpdated
 
@@ -78,6 +123,22 @@ Singleton {
             root.online = true;
             root.lastError = "";
             root.statesUpdated();
+
+            // Al primo giro che trova Home Assistant raggiungibile, chiede
+            // anche le coordinate. Se la chiamata fallisce si riprova al giro
+            // dopo: finche' non sono arrivate chi ne ha bisogno resta senza.
+            if (!root.locationFetched)
+                root.request("GET", "/api/config", null, function (okCfg, cfg) {
+                    if (!okCfg || !cfg)
+                        return;
+
+                    // Un'installazione senza posizione e' rara ma esiste:
+                    // NaN dice a chi legge "niente coordinate", non 0,0 —
+                    // che sarebbe un punto dell'oceano molto convincente.
+                    root.latitude = isFinite(cfg.latitude) ? cfg.latitude : NaN;
+                    root.longitude = isFinite(cfg.longitude) ? cfg.longitude : NaN;
+                    root.locationFetched = true;
+                });
         });
     }
 
@@ -247,7 +308,7 @@ Singleton {
         onFileChanged: reload()
         onLoaded: {
             root.refresh();
-            root.refreshHistory(root.historyEntities);
+            root.refreshHistory(root.historyWanted);
         }
         // Al primo avvio il file non esiste: lo creiamo con i valori di default.
         onLoadFailed: error => {
@@ -280,9 +341,9 @@ Singleton {
     // richiedere piu' spesso.
     Timer {
         interval: root.historyBucketMinutes * 60 * 1000
-        running: root.historyEntities.length > 0
+        running: root.historyWanted.length > 0
         repeat: true
-        onTriggered: root.refreshHistory(root.historyEntities)
+        onTriggered: root.refreshHistory(root.historyWanted)
     }
 
     Timer {

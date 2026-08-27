@@ -64,6 +64,31 @@ Singleton {
     // di scegliere e non dare da scegliere e' meta' messaggio.
     property var choices: []
 
+    // Quando manca la chiave di HealthBridge, o e' stata rigenerata sul
+    // telefono. Vale la stessa regola di `choices`: l'errore dice cosa fare e
+    // il pannello deve poterlo far fare li' dov'e' scritto, se no manda a
+    // cercare un terminale per un comando solo.
+    //
+    // Non si guarda il testo dell'errore ma il campo `need` che lo accompagna:
+    // confrontare stringhe italiane legherebbe questo file alla traduzione di
+    // un altro.
+    property bool needsToken: false
+    property bool pairing: false
+    property string pairError: ""
+
+    // La chiave gia' registrata, riletta da chi la conserva.
+    //
+    // Non serve a leggere il battito — la chiave la mette lo script da se', e
+    // questo file non la vede mai passare. Serve dove la si cambia: la finestra
+    // delle opzioni si apre quando l'utente vuole, non quando qualcosa si e'
+    // rotto, e un campo vuoto li' dentro direbbe «non c'e' nessuna chiave»
+    // anche mentre ce n'e' una che funziona.
+    //
+    // Si rilegge, non si tiene: due posti che sanno qual e' la chiave sono due
+    // posti da tenere allineati, ed e' la stessa ragione per cui `pair` non la
+    // scrive da qui.
+    property string token: ""
+
     // L'ultimo battito che Health Connect conosce, e quanti secondi fa e'
     // stato misurato: le due cose vanno sempre insieme.
     property var latest: null
@@ -172,6 +197,48 @@ Singleton {
         root.refreshToday();
     }
 
+    /**
+     * La chiave, consegnata allo script che la conserva.
+     *
+     * Non la si scrive da qui: `phone_adb.py` e' l'unico che sa dove vive, e
+     * due posti che scrivono lo stesso file sono due posti da tenere allineati.
+     * `health-pair` la prova anche subito, quindi un errore torna adesso e non
+     * al prossimo giro del timer.
+     */
+    /**
+     * La chiave registrata, richiesta a chi la conserva.
+     *
+     * Costa un processo e nessuna rete: dall'altra parte e' la lettura di un
+     * file. Sta fuori dal giro del polling apposta — quella chiave cambia solo
+     * quando la si cambia, e chiederla ogni minuto sarebbe un processo al
+     * minuto per una risposta sempre uguale.
+     */
+    function readToken() {
+        if (keeper.running)
+            return;
+
+        keeper.command = [...root.runner, "health-key"];
+        keeper.running = true;
+    }
+
+    function pair(token) {
+        if (pairer.running || !token)
+            return;
+
+        root.pairing = true;
+        root.pairError = "";
+        pairer.command = [...root.runner, "health-pair", token];
+        pairer.running = true;
+    }
+
+    // Quando l'errore reclama la chiave e' anche il momento in cui il pannello
+    // apre il campo per scriverla: se dentro non c'e' quella vecchia, chi l'ha
+    // rigenerata sul telefono non ha modo di vedere che e' cambiata davvero.
+    onNeedsTokenChanged: {
+        if (root.needsToken)
+            root.readToken();
+    }
+
     onWatchersChanged: {
         if (root.watchers === 1)
             root.start();
@@ -229,10 +296,12 @@ Singleton {
                         root.absorb(data);
                         root.lastError = "";
                         root.choices = [];
+                        root.needsToken = false;
                         root.backoff = 0;
                     } else {
                         root.lastError = data.error ?? "";
                         root.choices = data.choices ?? [];
+                        root.needsToken = data.need === "token";
                         root.backoff = Math.min(3, root.backoff + 1);
                         if (root.watchers > 0)
                             retry.restart();
@@ -249,6 +318,72 @@ Singleton {
                 root.loading = false;
                 if (!root.lastError)
                     root.lastError = `phone_adb.py uscito con codice ${code}`;
+            }
+        }
+    }
+
+    /**
+     * L'esito della consegna della chiave.
+     *
+     * Alla riuscita si rilegge subito, senza aspettare il timer: chi ha appena
+     * incollato una chiave sta guardando il pannello adesso, e il backoff
+     * dell'errore precedente puo' essere arrivato a mezz'ora.
+     */
+    Process {
+        id: pairer
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const data = JSON.parse(this.text);
+
+                    if (data.ok) {
+                        root.needsToken = false;
+                        root.pairError = data.note ?? "";
+                        root.lastError = "";
+                        root.backoff = 0;
+                    } else {
+                        root.pairError = data.error ?? "";
+                    }
+                } catch (e) {
+                    root.pairError = "risposta illeggibile: " + e;
+                }
+
+                // Per ultimo, e non per primo: chi guarda `pairing` spegnersi
+                // legge subito dopo com'e' andata, e trovare ancora lo stato di
+                // prima vorrebbe dire mostrare per un istante la richiesta
+                // della chiave a chi l'ha appena data.
+                root.pairing = false;
+
+                root.readToken();
+
+                if (!root.needsToken && root.watchers > 0)
+                    root.start();
+            }
+        }
+
+        onExited: code => {
+            root.pairing = false;
+            if (code !== 0 && !root.pairError)
+                root.pairError = `phone_adb.py uscito con codice ${code}`;
+        }
+    }
+
+    Process {
+        id: keeper
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                try {
+                    const data = JSON.parse(this.text);
+
+                    if (data.ok)
+                        root.token = data.token ?? "";
+                } catch (e) {
+                    // Il campo resta vuoto e si riscrive a mano: e' meno di
+                    // quello che si voleva, non un guasto da raccontare a
+                    // qualcuno che stava guardando altro.
+                }
             }
         }
     }

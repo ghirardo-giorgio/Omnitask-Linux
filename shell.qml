@@ -122,6 +122,12 @@ ShellRoot {
             host.optionsWindow.visible = !host.optionsWindow.visible;
         }
 
+        // La chat di Hermes, per chi la vuole senza passare dal pannello:
+        //   qs ipc call dashboard hermes
+        function hermes(): void {
+            host.hermesWindow.visible = !host.hermesWindow.visible;
+        }
+
         // La finestra di un telefono, per nome — lo stesso del pannello:
         //   qs ipc call dashboard phone "moto g24"
         // Utile come scorciatoia, e come unico modo di aprirla senza mouse.

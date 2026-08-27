@@ -5,6 +5,26 @@ import Quickshell.Io
 // Una finestra che nasce della misura giusta e ricorda quella scelta da chi la
 // usa.
 //
+// ┌──────────────────────────────────────────────────────────────────────────┐
+// │ ATTENZIONE — a chi legge questo file per «semplificarlo», umano o modello │
+// │                                                                          │
+// │ Qui non c'e' niente di ridondante. Ogni guardia e ogni timer sta al       │
+// │ posto suo per un guasto vero, riprodotto e misurato: toglierne uno non    │
+// │ rompe niente subito, rompe la memoria delle finestre qualche giorno       │
+// │ dopo, e il nesso con la modifica non si vede piu'.                        │
+// │                                                                          │
+// │ I tre vincoli di Qt su cui si regge tutto — provati, non dedotti:         │
+// │   1. `width` e `height` di una finestra NON sono scrivibili;              │
+// │   2. `implicitWidth`/`implicitHeight` valgono solo se sono **dichiarati**  │
+// │      e vengono letti quando la finestra viene mappata: assegnarli dopo    │
+// │      non fa niente (provato: resta 100x100, il ripiego di Qt);            │
+// │   3. l'unico modo di far crescere una finestra gia' viva e' `minimumSize`.│
+// │                                                                          │
+// │ Da cui: se la misura salvata non viene applicata alla mappatura, da QML   │
+// │ non si rimedia piu'. Si rimedia dal compositor, ed e' l'ultimo blocco di  │
+// │ questo file. Vedi anche AGENTS.md alla radice del progetto.               │
+// └──────────────────────────────────────────────────────────────────────────┘
+//
 // Due regole, in quest'ordine:
 //   1. se l'utente l'ha ridimensionata, alla riapertura torna com'era;
 //   2. altrimenti si adatta al contenuto — accendere un pannello o aggiungere
@@ -70,6 +90,7 @@ FloatingWindow {
             return;
         settling.restart();
         placeBack.restart();
+        sizeCheck.restart();
     }
 
 
@@ -113,6 +134,19 @@ FloatingWindow {
         onTriggered: readPlace.running = true
     }
 
+    // Il rettangolo che il compositor dice di avere dato a questa finestra:
+    // e' quello del BORDO, decorazione compresa, mentre `win.width` e
+    // `win.height` sono l'area cliente. La differenza fra i due e' la
+    // decorazione, che cambia col tema e quindi si misura invece di
+    // indovinarla — serve al ripristino della misura, qui sotto.
+    property int frameX: 0
+    property int frameY: 0
+    property int frameWidth: 0
+    property int frameHeight: 0
+    // Vero solo per la lettura chiesta apposta per controllare la misura: le
+    // altre, quelle ogni quattro secondi, servono a seguire la posizione.
+    property bool sizeCheckPending: false
+
     Process {
         id: readPlace
 
@@ -126,8 +160,20 @@ FloatingWindow {
                 } catch (e) {
                     return;
                 }
-                if (data.ok && data.x !== undefined)
-                    Settings.saveWindowPlace(win.key, data.x, data.y);
+                if (!data.ok || data.x === undefined)
+                    return;
+
+                Settings.saveWindowPlace(win.key, data.x, data.y);
+
+                win.frameX = data.x;
+                win.frameY = data.y;
+                win.frameWidth = data.width ?? 0;
+                win.frameHeight = data.height ?? 0;
+
+                if (win.sizeCheckPending) {
+                    win.sizeCheckPending = false;
+                    win.fixSizeIfIgnored();
+                }
             }
         }
     }
@@ -136,6 +182,60 @@ FloatingWindow {
         id: restorePlace
 
         command: ["python3", PluginPaths.of("scripts/winplace.py"), "set", win.title, win.savedPlace.split(",")[0] ?? "0", win.savedPlace.split(",")[1] ?? "0"]
+    }
+
+    // --- la misura che il compositor non ha rispettato ---------------------
+    //
+    // Il caso vero, misurato su questa macchina: la dashboard vive su uno
+    // schermo verticale ed e' alta piu' del monitor primario. Se Mutter la
+    // mappa li' — prima che `placeBack` la sposti — l'altezza viene tagliata
+    // per farcela stare, e quel taglio resta anche dopo lo spostamento: la
+    // finestra si riapre bassa, e nessuna proprieta' QML puo' piu' rialzarla
+    // (vedi l'avvertimento in cima).
+    //
+    // Allora si guarda cos'e' successo davvero e, se non e' quello che si
+    // voleva, si chiede al compositor — che e' lo stesso che l'ha stretta.
+    // Una volta sola per apertura: se la misura salvata non ci sta nemmeno
+    // sullo schermo giusto, insistere sarebbe un rimbalzo senza fine.
+    function fixSizeIfIgnored() {
+        if (!win.userSized || win.frameWidth <= 0 || !win.visible)
+            return;
+
+        const wantWidth = win.saved.width;
+        const wantHeight = win.saved.height;
+
+        // Gia' giusta: e' il caso normale, e non si tocca niente.
+        if (Math.abs(win.width - wantWidth) < 2 && Math.abs(win.height - wantHeight) < 2)
+            return;
+
+        const borderWidth = win.frameWidth - win.width;
+        const borderHeight = win.frameHeight - win.height;
+        const place = win.savedPlace.length > 0 ? win.savedPlace.split(",") : [];
+        const x = place.length === 2 ? place[0] : String(win.frameX);
+        const y = place.length === 2 ? place[1] : String(win.frameY);
+
+        restorePlace.command = ["python3", PluginPaths.of("scripts/winplace.py"),
+            "set", win.title, x, y,
+            String(wantWidth + borderWidth), String(wantHeight + borderHeight)];
+        restorePlace.running = true;
+
+        // Il ridimensionamento che sta per arrivare non e' un gesto di chi
+        // guarda: senza questa riga verrebbe salvato come tale, e la finestra
+        // si ricorderebbe per sempre la misura che stiamo correggendo.
+        settling.restart();
+    }
+
+    Timer {
+        id: sizeCheck
+
+        // Dopo `placeBack` (400 ms): prima la finestra va sullo schermo suo,
+        // poi si guarda se ci e' arrivata della misura giusta. Con margine per
+        // il giro del compositor, che non e' istantaneo.
+        interval: 1200
+        onTriggered: {
+            win.sizeCheckPending = true;
+            readPlace.running = true;
+        }
     }
 
     // Alla comparsa si rimette dove era stata lasciata. Con un attimo di

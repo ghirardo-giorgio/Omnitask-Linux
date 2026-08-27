@@ -26,18 +26,42 @@ Singleton {
     // -1 quando non si sa: pkcon la stampa solo in certe fasi
     property real progress: -1
     property string message: ""
+    // pkcon e' uscito con successo senza aver aggiornato niente: la sua lista
+    // era vuota. E' l'unica differenza fra «fatto» e «non c'era niente da
+    // fare», e senza saperla il pannello direbbe «completato» lasciando il
+    // conteggio dov'era.
+    property bool nothingToDo: false
 
     readonly property bool canUpdateSystem: SystemStats.health.updates?.packagekit ?? false
 
+    // pkcon traduce le proprie righe: in una sessione giapponese "Status"
+    // diventa "状態" e il parser qui sotto non trova piu' niente da leggere.
+    // L'unica lingua che non cambia e' nessuna lingua — quello che si mostra
+    // a video lo traduce I18n, non il comando.
+    readonly property var plainOutput: ({
+            LC_ALL: "C",
+            LANG: "C"
+        })
+
+    // Prima la lista, poi l'aggiornamento.
+    //
+    // PackageKit tiene una cache dei metadati tutta sua
+    // (/var/cache/PackageKit) e non quella di dnf, da cui viene invece il
+    // conteggio che si vede nel pannello. Le due divergono: il 26 agosto 2026
+    // il pannello contava sette aggiornamenti che pkcon non vedeva, con la sua
+    // copia dei metadati ferma a due giorni prima. `pkcon update` usciva
+    // subito con successo senza aver fatto niente, e da fuori era un pulsante
+    // che non rispondeva.
+    //
+    // `force` e non il refresh normale: quello rispetta metadata_expire e in
+    // quel caso non aveva riscaricato niente — settecento millisecondi e via.
+    // Qualche secondo prima di un'operazione che ne dura molti di piu'.
     function updateSystem() {
         if (root.busy.length > 0)
             return;
         root.begin("system");
-        // -y: non chiedere conferma nel terminale (l'ha gia' chiesta la
-        // dashboard). -p: output a righe "Chiave: valore" invece delle
-        // animazioni, che a un parser non servono.
-        systemProc.command = ["pkcon", "-y", "-p", "update"];
-        systemProc.running = true;
+        root.phase = I18n.t("rileggo la lista dei pacchetti…");
+        refreshProc.running = true;
     }
 
     function updateFlatpak() {
@@ -53,6 +77,7 @@ Singleton {
         root.phase = "";
         root.progress = -1;
         root.message = "";
+        root.nothingToDo = false;
     }
 
     // Chiuso il comando, i conteggi che si vedono sono vecchi: far ripartire il
@@ -63,7 +88,14 @@ Singleton {
         root.phase = "";
         root.progress = -1;
         if (code === 0) {
-            root.message = I18n.t("aggiornamento completato");
+            // Dirlo e non tacerlo: se PackageKit non ha trovato niente mentre
+            // il pannello conta ancora dei pacchetti, il pulsante ha
+            // funzionato ed e' la sua lista a non combaciare con quella di
+            // dnf. Sono due cose diverse da riparare, e chi guarda deve poter
+            // capire quale delle due sta guardando.
+            root.message = root.nothingToDo
+                ? I18n.t("PackageKit non aveva niente da aggiornare")
+                : I18n.t("aggiornamento completato");
             SystemStats.restart();
         } else {
             const first = error.trim().split("\n").filter(l => l.trim().length > 0);
@@ -74,10 +106,40 @@ Singleton {
     }
 
     Process {
+        id: refreshProc
+
+        command: ["pkcon", "refresh", "force"]
+        environment: root.plainOutput
+
+        // Un refresh andato male non ferma l'aggiornamento: puo' essere un
+        // repository irraggiungibile su venti, e i pacchetti degli altri
+        // diciannove si aggiornano lo stesso. Se il guasto e' serio lo dira'
+        // l'update un attimo dopo, con parole sue.
+        onExited: {
+            root.phase = "";
+            // -y: non chiedere conferma nel terminale (l'ha gia' chiesta la
+            // dashboard). -p: output a righe "Chiave: valore" invece delle
+            // animazioni, che a un parser non servono.
+            systemProc.command = ["pkcon", "-y", "-p", "update"];
+            systemProc.running = true;
+        }
+    }
+
+    Process {
         id: systemProc
+
+        environment: root.plainOutput
 
         stdout: SplitParser {
             onRead: line => {
+                // La riga che pkcon scrive quando la sua lista e' vuota. Non ha
+                // due punti e non e' una fase: si guarda prima di tutto il
+                // resto, altrimenti finirebbe scartata come rumore.
+                if (line.indexOf("There are no updates") >= 0) {
+                    root.nothingToDo = true;
+                    return;
+                }
+
                 // "Chiave:\tvalore", con la tabulazione: si divide sui due
                 // punti e si toglie lo spazio che resta.
                 const cut = line.indexOf(":");
@@ -101,6 +163,8 @@ Singleton {
 
     Process {
         id: flatpakProc
+
+        environment: root.plainOutput
 
         stdout: SplitParser {
             onRead: line => {

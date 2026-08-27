@@ -187,7 +187,7 @@ Rectangle {
                 font.pixelSize: 10
 
                 text: I18n.t(
-                    "Trascina ⠿ per cambiare l'ordine dentro la colonna, S/D per spostare un pannello nell'altra, l'interruttore per spegnerlo."
+                    "Trascina ⠿ per cambiare l'ordine dentro la colonna, S/C/D per spostare un pannello in un'altra, l'interruttore per spegnerlo. La colonna centrale compare nella dashboard solo quando ha qualcosa dentro."
                 )
             }
 
@@ -196,6 +196,11 @@ Rectangle {
                     {
                         key: "left",
                         title: I18n.t("COLONNA SINISTRA"),
+                        draggable: true
+                    },
+                    {
+                        key: "center",
+                        title: I18n.t("COLONNA CENTRALE"),
                         draggable: true
                     },
                     {
@@ -218,6 +223,9 @@ Rectangle {
                     readonly property var ids: {
                         if (group.modelData.key === "left")
                             return Settings.left;
+
+                        if (group.modelData.key === "center")
+                            return Settings.center;
 
                         if (group.modelData.key === "right")
                             return Settings.right;
@@ -560,6 +568,10 @@ Rectangle {
                                                 {
                                                     id: "left",
                                                     label: "S"
+                                                },
+                                                {
+                                                    id: "center",
+                                                    label: "C"
                                                 },
                                                 {
                                                     id: "right",
@@ -2240,6 +2252,219 @@ Rectangle {
                 font.letterSpacing: 1
 
                 text: I18n.t("BATTITO")
+            }
+
+            Text {
+                Layout.fillWidth: true
+
+                wrapMode: Text.Wrap
+                color: "#6e7681"
+                font.pixelSize: 10
+
+                text:
+                    I18n.t(
+                        "La chiave di HealthBridge, quella scritta sotto l'indirizzo nell'app del telefono. La porta è aperta a chiunque sia sulla rete di casa, e la chiave è ciò che distingue questa dashboard da chiunque altro: senza, il telefono non risponde. Si riscrive qui quando la si rigenera sul telefono."
+                    )
+            }
+
+            // La chiave si cambia anche quando niente e' rotto.
+            //
+            // Il pannello del battito ne apre gia' uno, di campo, ma solo
+            // quando la lettura fallisce reclamandola: e' il momento giusto per
+            // chi non l'ha mai data, e nessun momento per chi l'ha appena
+            // rigenerata sul telefono e vuole rimetterla a posto prima che il
+            // grafico se ne accorga. Qui non serve che qualcosa vada storto.
+            //
+            // Non la si scrive da qui piu' di quanto la scriva il pannello:
+            // tutti e due passano da `Fitbit.pair`, e da li' da phone_adb.py,
+            // che e' l'unico posto che sa in quale file vive.
+            RowLayout {
+                id: healthKey
+
+                // Quella registrata si rilegge all'apertura invece di tenerne
+                // una copia qui: una copia sarebbe una cosa in piu' da
+                // aggiornare quando il pannello del battito cambia la chiave
+                // mentre questa finestra e' chiusa.
+                Component.onCompleted: Fitbit.readToken()
+
+                onVisibleChanged: {
+                    if (healthKey.visible)
+                        Fitbit.readToken();
+                }
+
+                Layout.fillWidth: true
+
+                spacing: 6
+
+                Rectangle {
+                    Layout.fillWidth: true
+
+                    implicitHeight: 30
+                    radius: 6
+
+                    color: "#161b22"
+
+                    border.width: 1
+
+                    border.color:
+                        keyInput.activeFocus
+                        ? "#58a6ff"
+                        : "#30363d"
+
+                    TextInput {
+                        id: keyInput
+
+                        // La chiave non si nasconde mentre la si scrive: sta
+                        // gia' in chiaro sullo schermo del telefono da cui la
+                        // si copia, e mascherarla toglierebbe solo il modo di
+                        // accorgersi di un carattere sbagliato.
+                        anchors.fill: parent
+
+                        anchors.leftMargin: 10
+                        anchors.rightMargin: 10
+
+                        verticalAlignment: TextInput.AlignVCenter
+
+                        clip: true
+                        color: "#c9d1d9"
+                        font.pixelSize: 12
+                        font.family: "monospace"
+
+                        selectionColor: "#1f6feb"
+
+                        enabled: !Fitbit.pairing
+
+                        // Nove caratteri di un alfabeto senza le lettere che si
+                        // confondono con le cifre: e' cosi' che l'app la
+                        // genera, e filtrare qui evita di mandare allo script
+                        // una chiave che non puo' essere giusta.
+                        maximumLength: 9
+
+                        validator: RegularExpressionValidator {
+                            regularExpression: /[a-hj-km-np-z2-9]*/
+                        }
+
+                        text: Fitbit.token
+
+                        onAccepted:
+                            Fitbit.pair(keyInput.text)
+
+                        Keys.onEscapePressed:
+                            keyInput.text = Fitbit.token
+
+                        // Il binding con `token` si spezza al primo carattere
+                        // scritto, che e' giusto — ma allora una chiave data
+                        // dal pannello del battito mentre questa finestra e'
+                        // aperta non comparirebbe mai qui dentro.
+                        Connections {
+                            target: Fitbit
+
+                            function onTokenChanged() {
+                                keyInput.text = Fitbit.token;
+                            }
+                        }
+
+                        Text {
+                            anchors.verticalCenter:
+                                parent.verticalCenter
+
+                            visible: keyInput.text === ""
+
+                            color: "#484f58"
+                            font.pixelSize: 12
+
+                            text:
+                                I18n.t("la chiave scritta nell'app, poi Invio")
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: keyButton
+
+                    readonly property bool ready:
+                        keyInput.text !== "" && !Fitbit.pairing
+
+                    implicitWidth: keyLabel.implicitWidth + 20
+                    implicitHeight: 30
+                    radius: 6
+
+                    color:
+                        keyHover.hovered && keyButton.ready
+                        ? "#21262d"
+                        : "transparent"
+
+                    border.width: 1
+
+                    border.color:
+                        keyButton.ready
+                        ? "#30363d"
+                        : "#21262d"
+
+                    HoverHandler {
+                        id: keyHover
+
+                        cursorShape:
+                            keyButton.ready
+                            ? Qt.PointingHandCursor
+                            : Qt.ArrowCursor
+                    }
+
+                    TapHandler {
+                        enabled: keyButton.ready
+
+                        onTapped:
+                            Fitbit.pair(keyInput.text)
+                    }
+
+                    Text {
+                        id: keyLabel
+
+                        anchors.centerIn: parent
+
+                        color:
+                            keyButton.ready
+                            ? "#c9d1d9"
+                            : "#484f58"
+
+                        font.pixelSize: 11
+
+                        text:
+                            Fitbit.pairing
+                            ? I18n.t("collego…")
+                            : I18n.t("Collega")
+                    }
+                }
+            }
+
+            // Com'e' andata, o cosa manca. `health-pair` prova la chiave
+            // subito, quindi qui c'e' gia' la risposta del telefono e non solo
+            // la conferma di aver scritto un file — che sarebbe la sola cosa
+            // che si sa quando si salva senza provare.
+            Text {
+                Layout.fillWidth: true
+
+                wrapMode: Text.Wrap
+                font.pixelSize: 10
+
+                visible: text !== ""
+
+                color:
+                    Fitbit.pairError || Fitbit.needsToken
+                    ? "#d29922"
+                    : "#6e7681"
+
+                text: {
+                    if (Fitbit.pairing)
+                        return I18n.t("provo la chiave sul telefono…");
+                    if (Fitbit.pairError)
+                        return Fitbit.pairError;
+                    if (Fitbit.needsToken)
+                        return Fitbit.lastError;
+                    if (!Fitbit.token)
+                        return I18n.t("nessuna chiave registrata");
+                    return "";
+                }
             }
 
             Text {

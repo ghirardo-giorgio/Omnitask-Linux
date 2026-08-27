@@ -2,6 +2,11 @@ import QtQuick
 import QtQuick.Layouts
 import Quickshell
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // Batteria, connessione e clipboard dei dispositivi accoppiati con KDE Connect.
 //
 // Si annuncia a KdeConnect alla nascita e si toglie quando muore: e' quello
@@ -16,6 +21,13 @@ import Quickshell
 // tutti gli altri che lo usano.
 ColumnLayout {
     id: root
+
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "phones"
+    property string panelTitle: "Telefoni"
 
     spacing: 6
 
@@ -169,6 +181,18 @@ ColumnLayout {
             TapHandler {
                 acceptedButtons: Qt.LeftButton
                 onDoubleTapped: DashActions.openPhone(device.modelData.name)
+            }
+
+            // L'esito del collegamento torna qui e non nella finestra: e'
+            // partito da questa riga, ed e' sotto questo nome che il pannello
+            // scrive gia' com'e' andata coi tasti degli appunti.
+            Connections {
+                target: PhoneAdb
+
+                function onConnectDone(name: string, ok: bool, text: string): void {
+                    if (name === device.modelData.name)
+                        KdeConnect.setStatus(device.modelData.id, text, ok);
+                }
             }
 
             RowLayout {
@@ -419,6 +443,69 @@ ColumnLayout {
 
                         interval: 1200
                         onTriggered: line.copied = false
+                    }
+                }
+
+                // Collega: una sessione ADB senza fili cade da se' — basta
+                // che il telefono dorma o che il Wi-Fi si assopisca — mentre
+                // il debug resta acceso, ed e' un comando solo a rimetterla in
+                // piedi. Sta qui perche' qui si vede la targhetta ADB rossa:
+                // aprire la finestra per premere «Collega» sarebbe passare da
+                // un'altra stanza per accendere questa luce.
+                //
+                // Le due frecce affiancate e non gli anelli: quelli qui
+                // accanto vogliono gia' dire «riassocia», e due glifi che si
+                // somigliano per due azioni diverse sono un glifo sbagliato
+                // premuto meta' delle volte. Orizzontali, che le distingue
+                // dalle frecce degli appunti nella riga sopra.
+                Text {
+                    id: plug
+
+                    // Un telefono gia' collegato non ha niente da collegare.
+                    // Spenta e non nascosta, come le frecce degli appunti: al
+                    // clic dice perche' invece di sparire.
+                    readonly property bool linked: line.adb !== null && (line.adb.connected ?? false)
+                    readonly property bool working: PhoneAdb.connecting === device.modelData.name
+
+                    color: {
+                        if (plug.working)
+                            return "#d29922";
+                        if (plug.linked)
+                            return "#30363d";
+                        return plugHover.hovered ? "#58a6ff" : "#484f58";
+                    }
+                    font.pixelSize: 10
+                    text: "⇌"
+
+                    HoverHandler {
+                        id: plugHover
+
+                        cursorShape: plug.linked || plug.working ? Qt.ArrowCursor : Qt.PointingHandCursor
+                    }
+
+                    TapHandler {
+                        onSingleTapped: {
+                            if (plug.working)
+                                return;
+
+                            if (plug.linked) {
+                                KdeConnect.setStatus(device.modelData.id, I18n.t("ADB e' gia' collegato"), true);
+                                return;
+                            }
+
+                            // Il collegamento puo' prendere qualche secondo —
+                            // l'ascolto dell'annuncio, i tentativi porta per
+                            // porta — e senza una parola subito il clic
+                            // sembrerebbe non aver fatto niente.
+                            KdeConnect.setStatus(device.modelData.id, I18n.t("collegamento…"), true);
+                            PhoneAdb.connectPhone(device.modelData.name);
+                        }
+                    }
+
+                    Tooltip {
+                        hovered: plugHover.hovered
+                        text: plug.linked ? I18n.t("ADB e' gia' collegato")
+                            : I18n.t("Collega ADB senza fili")
                     }
                 }
 

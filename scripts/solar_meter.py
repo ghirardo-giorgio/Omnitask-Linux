@@ -5,8 +5,16 @@ Il tester USB fra il pannello e la power bank sa tutto — tensione, corrente,
 potenza, energia raccolta — e non lo dice a nessuno: non ha radio, non ha
 porta dati, ha solo uno schermo. L'unico modo di portarne fuori i numeri e'
 guardarlo, ed e' quello che si fa qui: uno scatto macro col telefono
-appoggiato davanti (scripts/phone_adb.py, comando `photo`), l'OCR dell'app
-companion, e i valori finiscono in Home Assistant accanto ai sensori di CO2.
+appoggiato davanti, l'OCR dell'app companion, e i valori finiscono in Home
+Assistant accanto ai sensori di CO2.
+
+Lo scatto lo chiede macrocam_web.py, che parla in HTTP con MacroCam Web
+(~/Documents/Development/macrocam-web): il telefono tiene aperta una porta e
+risponde senza accendere lo schermo. La strada di prima — phone_adb.py e un
+`am start` sull'app ad ADB — resta come ripiego, e si sceglie con
+`--transport`. Non e' nostalgia: e' che un telefono a cui hanno spento il
+debug wireless, o che ha perso il server dopo un riavvio, non deve portarsi
+dietro anche la giornata di misure.
 
 Il problema di leggere un display a fotografie e' che l'OCR sbaglia, e sbaglia
 in silenzio. Su questo schermo si e' gia' visto Ω diventare 2, Wh diventare 0h,
@@ -40,9 +48,11 @@ import urllib.error
 import urllib.request
 from datetime import date, datetime, timedelta
 
+import macrocam_web
 import phone_adb
-
-HA_CONFIG = os.path.expanduser("~/.config/quickshell/home-assistant.json")
+# Le stesse due funzioni le usa hygrometer.py per pubblicare l'igrometro: da
+# quando sono in due, stanno in ha.py invece che una copia per strumento.
+from ha import HA_CONFIG, ha_call, ha_config  # noqa: F401  (HA_CONFIG serve ai messaggi)
 
 # Il rettangolo da leggere non si impone a ogni scatto: lo tiene il telefono.
 #
@@ -56,7 +66,37 @@ HA_CONFIG = os.path.expanduser("~/.config/quickshell/home-assistant.json")
 # Questo resta come seme: serve la primissima volta, o se all'app venissero
 # cancellati i dati e si ritrovasse senza. Non e' piu' l'ultima parola.
 DEFAULT_ROI = "0.23148148,0.446875,0.71481484,0.6856771"
+
+# Lo stesso nome vale per tutt'e due le strade: e' quello con cui KDE Connect
+# conosce il telefono, ed e' da li' che entrambe ricavano l'indirizzo.
 DEFAULT_DEVICE = "OPG02_jp_kdi"
+
+# Quale strada per arrivare al telefono: "web" e' MacroCam Web, "adb" e' l'app
+# di prima, "auto" prova la prima e ripiega sulla seconda.
+#
+# Il ripiego si decide sul fallimento e non sulla configurazione, perche' i
+# modi di non rispondere sono piu' di uno — server non avviato, telefono
+# spostato di rete, chiave cambiata — e nessuno di quelli si vede da qui prima
+# di provare. Quando succede, il motivo resta scritto nella lettura: un
+# ripiego silenzioso e permanente vorrebbe dire scoprire fra un mese che la
+# strada nuova non e' mai stata usata.
+TRANSPORT = "auto"
+
+# Il display del tester ha sette segmenti e nient'altro: cifre, punti e due
+# lettere. Dirlo all'app fa risparmiare la passata di controllo col modello
+# giapponese, che serve quando l'alfabeto non si sa — qui si sa.
+SCRIPT = "latin"
+
+# Un nome fisso per lo scatto, e quindi un file solo sul telefono invece di uno
+# nuovo ogni dieci minuti.
+#
+# Senza nome l'app ne inventa uno col timestamp, che per uno scatto chiesto a
+# mano e' giusto e per un timer e' una perdita: la cartella dell'app vecchia,
+# che ha sempre lavorato cosi', e' arrivata a 1293 file e mezzo giga. Qui
+# ognuno riscrive il precedente — la storia sta sul PC, dove i file scaricati
+# hanno gia' la data nel nome, e su Home Assistant, che e' il posto dove la si
+# guarda.
+SHOT_NAME = "solare"
 
 # Dove si tiene il conto della giornata: il contatore del tester a inizio
 # giornata, e l'ultimo letto.
@@ -93,6 +133,14 @@ ROI_RECORD = os.path.join(
 POWER_TOLERANCE = 0.02
 RESISTANCE_TOLERANCE = 0.05
 
+# Quanto puo' calare il contatore mAh prima che la discesa venga messa in
+# discussione. Finche' c'e' corrente il contatore non cala mai: l'unica
+# discesa vera e' il riavvio del tester, che azzererebbe anche il cronometro
+# dello schermo. La tolleranza assorbe solo il brusio dell'OCR sull'ultima
+# cifra — non le code di numero troncato, come 5163 per 65163, che sono
+# migliaia e cadono tutte dentro il sospetto.
+COUNTER_DROP_TOLERANCE = 1000
+
 # Da che altezza del sole in su vale la pena guardare il tester. Zero significa
 # esattamente dall'alba al tramonto: sopra l'orizzonte si misura, sotto no.
 #
@@ -123,43 +171,6 @@ SENSORS = {
 # ------------------------------------------------------------ home assistant
 
 
-def ha_config():
-    """Url e token, dallo stesso file che legge HomeAssistant.qml.
-
-    Non una copia della configurazione: proprio quel file. Un token in due
-    posti e' un token che prima o poi ne vale mezzo.
-    """
-    try:
-        with open(HA_CONFIG) as handle:
-            data = json.load(handle)
-    except (OSError, ValueError) as exc:
-        raise SystemExit(f"configurazione di Home Assistant illeggibile ({HA_CONFIG}): {exc}")
-
-    if not data.get("url") or not data.get("token"):
-        raise SystemExit(f"url o token mancanti in {HA_CONFIG}")
-
-    return data["url"].rstrip("/"), data["token"]
-
-
-def ha_call(path, payload=None, timeout=15):
-    """Una chiamata alle API di Home Assistant, GET o POST secondo il payload."""
-    url, token = ha_config()
-    body = json.dumps(payload).encode() if payload is not None else None
-
-    request = urllib.request.Request(
-        url + path,
-        data=body,
-        headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-        },
-        method="POST" if payload is not None else "GET",
-    )
-
-    with urllib.request.urlopen(request, timeout=timeout) as answer:
-        return json.load(answer)
-
-
 def sun():
     """Dove sta il sole adesso, secondo Home Assistant.
 
@@ -182,7 +193,7 @@ def sun():
     }
 
 
-def publish(reading, sky, dry_run=False, dark=False):
+def publish(reading, sky, dry_run=False, dark=False, tempo=None):
     """Scrive le entita' in Home Assistant, una POST per sensore.
 
     Le entita' nascono qui e non da un'integrazione: /api/states le crea al
@@ -206,7 +217,7 @@ def publish(reading, sky, dry_run=False, dark=False):
         started = None
 
         if name == "carica":
-            value, started = daily_charge(value, persist=not dry_run)
+            value, started = daily_charge(value, persist=not dry_run, tempo=tempo)
 
         attributes = {
             "friendly_name": "Solare " + name,
@@ -312,7 +323,7 @@ def save_day(data):
             pass
 
 
-def daily_charge(raw, persist=True):
+def daily_charge(raw, persist=True, tempo=None):
     """I mAh raccolti da stamattina: il contatore di adesso meno quello di allora.
 
     Torna (oggi, inizio). La prima lettura del giorno fissa l'inizio, e da li'
@@ -325,6 +336,10 @@ def daily_charge(raw, persist=True):
     l'inizio si sposta li' invece di far comparire un numero negativo. Quello
     che si perde in quel caso e' la raccolta prima dell'azzeramento, che il
     tester non sa piu' nemmeno lui.
+
+    Il cronometro dello schermo viaggia col contatore e viene ricordato qui
+    accanto: e' lui che al giro dopo permette a `counter_suspect` di capire se
+    una discesa era un riavvio vero o una lettura troncata.
     """
     today = date.today()
     day = load_day()
@@ -350,6 +365,11 @@ def daily_charge(raw, persist=True):
 
     day["ultimo"] = raw
 
+    # Un cronometro non letto non cancella quello ricordato: il display spento,
+    # per esempio, ripubblica il contatore fermo ma non mostra nessun tempo.
+    if isinstance(tempo, int):
+        day["tempo"] = tempo
+
     if persist:
         save_day(day)
 
@@ -366,6 +386,119 @@ def held_charge():
     held = load_day().get("ultimo")
 
     return float(held) if isinstance(held, (int, float)) else None
+
+
+def tempo_seconds(text):
+    """Il cronometro del display in secondi, o None se non si e' letto.
+
+    "0023:47:26" -> 86_046 secondi da quando il tester ha corrente: la memoria
+    lunga che nessun altro campo del display ha, e l'unica cosa che un
+    riavvio vero azzererebbe per certo.
+    """
+    match = re.fullmatch(r"\s*(\d+)\s*:\s*(\d{2})\s*:\s*(\d{2})\s*", str(text or ""))
+
+    if not match:
+        return None
+
+    hours, minutes, seconds = (int(g) for g in match.groups())
+
+    return hours * 3600 + minutes * 60 + seconds
+
+
+def counter_suspect(raw, quality):
+    """Il contatore e' sceso ma il tester dice di non essersi mai spento.
+
+    La lettura del 25 agosto alle 14:30 ha letto 5163 al posto di 65163 — le
+    prime cifre perse, la coda intatta — e il valore, passando indenne ai
+    vincoli fisici (che riguardano V, I, P e R, non gli mAh), ha fatto
+    ripartire da se' la giornata. Il cronometro invece aveva continuato a
+    girare: era la prova che il tester non si era riavviato, e nessuno la
+    guardava. Da qui l'arbitro: contatore in calo con cronometro avanzato vuol
+    dire OCR troncatore, non tester riazzerrato, e la lettura va buttata.
+    """
+    day = load_day()
+    previous = day.get("ultimo")
+
+    if not isinstance(previous, (int, float)) or not isinstance(raw, (int, float)):
+        return False
+
+    if raw >= previous - COUNTER_DROP_TOLERANCE:
+        return False
+
+    now = tempo_seconds(quality.get("tempo_tester"))
+    before = day.get("tempo")
+
+    return now is not None and isinstance(before, int) and now > before
+
+
+def midnight_roll(sky=None, dry_run=False):
+    """Al primo giro dopo la mezzanotte il giorno ricomincia, senza fotografia.
+
+    Finora la giornata nuova nasceva alla prima lettura utile, cioe' quando il
+    sole tornava sopra l'orizzonte: fra le zero e l'alba il sensore portava
+    ancora la raccolta del giorno prima, e la finestra di fatto iniziava
+    all'alba. Invece la finestra e' 0:00-24:00 per definizione, quindi qui la
+    base riparte dall'ultimo contatore noto — di notte il tester non conta
+    niente, ed e' lo stesso numero che avrebbe letto una foto — e la carica
+    pubblicata scende a zero finche' il sole non torna.
+
+    Il contatore vero resta scritto negli attributi come in ogni altro
+    campione, cosi' il conto continua a essere verificabile anche da spento.
+    """
+    today = date.today()
+    day = load_day()
+
+    if day.get("giorno") == today.isoformat() and isinstance(day.get("inizio"), (int, float)):
+        return False
+
+    start = day.get("ultimo")
+
+    if not isinstance(start, (int, float)):
+        # Nessun contatore conosciuto: prima lettura in assoluto, o appunto
+        # perso. La prima foto del mattino sapra' aprire la giornata da se',
+        # con le sue regole su ieri e sull'ieri.
+        return False
+
+    tempo = day.get("tempo")
+
+    if dry_run:
+        return True
+
+    # Prima si pubblica poi si segna: se lo script morisse in mezzo, al giro
+    # dopo la stessa riga verrebbe riscritta identica — due volte lo stesso
+    # zero, e nessuna perdita.
+    try:
+        ha_call("/api/states/" + PREFIX + "carica", {
+            "state": 0.0,
+            "attributes": {
+                "friendly_name": "Solare carica",
+                "unit_of_measurement": "mAh",
+                "state_class": "total",
+                "totale_tester": round(float(start), 4),
+                "inizio_giornata": round(float(start), 4),
+                "last_reset": midnight(),
+                "sun_elevation": sky.get("elevation") if sky else None,
+                "sun_azimuth": sky.get("azimuth") if sky else None,
+                "source_image": "",
+                "lettura": "mezzanotte",
+            },
+        })
+    except (urllib.error.URLError, OSError, ValueError):
+        # Home Assistant irraggiungibile: l'appunto si aggiorna lo stesso,
+        # altrimenti ogni tick della notte riproverebbe all'infinito. Il
+        # sensore restera' al valore di ieri sera finche' non torna, e va
+        # bene cosi': e' un buco, non uno zero falso.
+        pass
+
+    rolled = {"giorno": today.isoformat(), "inizio": float(start),
+              "ultimo": float(start)}
+
+    if isinstance(tempo, int):
+        rolled["tempo"] = tempo
+
+    save_day(rolled)
+
+    return True
 
 
 def midnight():
@@ -669,12 +802,52 @@ def record_roi(roi):
             pass
 
 
-def capture(device, roi, dry_run=False):
-    """Uno scatto e la sua interpretazione, o il motivo per cui non si usa."""
+def shoot(device, roi, transport=TRANSPORT):
+    """Uno scatto, dalla strada che risponde.
+
+    Le due `do_photo` restituiscono le stesse chiavi apposta, quindi da qui in
+    poi nessuno deve piu' sapere quale delle due ha scattato. Chi legge la
+    lettura si', pero': `trasporto` lo dice, e `ripiego` dice perche', quando
+    c'e' stato.
+    """
+    web_error = ""
+
+    if transport in ("auto", "web"):
+        shot = macrocam_web.do_photo(mode="macro", target=device, roi=roi,
+                                     full=True, script=SCRIPT, name=SHOT_NAME)
+
+        if shot.get("ok") or transport == "web":
+            return shot
+
+        web_error = shot.get("error", "")
+
+    # L'app ad ADB non sa scegliere l'alfabeto — e' una cosa che sa fare solo
+    # quella nuova — quindi qui `script` non si passa: fa la sua cascata da
+    # sola, come ha sempre fatto.
     shot = phone_adb.do_photo(mode="macro", target=device, roi=roi, full=True)
+    shot["transport"] = "adb"
+
+    if web_error:
+        shot["fallback"] = web_error
+
+    return shot
+
+
+def capture(device, roi, dry_run=False, transport=TRANSPORT):
+    """Uno scatto e la sua interpretazione, o il motivo per cui non si usa."""
+    shot = shoot(device, roi, transport)
+
+    # Da che strada e' arrivata la foto, e se una delle due ha ceduto. Si legge
+    # prima di tutto il resto perche' si attacca a tutti gli esiti, non solo a
+    # quelli buoni: il caso in cui serve davvero saperlo e' quando la lettura
+    # non c'e'.
+    how = {"trasporto": shot.get("transport", "")}
+
+    if shot.get("fallback"):
+        how["ripiego"] = shot["fallback"]
 
     if not shot.get("ok"):
-        return None, {"errore": shot.get("error", "scatto fallito")}
+        return None, dict(how, errore=shot.get("error", "scatto fallito"))
 
     # Quello che il telefono ha davvero inquadrato, che con `roi` vuoto e' il
     # rettangolo suo. Registrarlo qui vuol dire che una riquadratura fatta col
@@ -690,26 +863,27 @@ def capture(device, roi, dry_run=False):
     # quando resta senza alimentazione, e continuare a parlare di cifre
     # illeggibili manderebbe a cercare il guasto nell'OCR invece che nel cavo.
     if len(text.strip()) < 8:
-        return None, {"errore": "il display del tester e' spento o al buio",
-                      "buio": True,
-                      "roi": used,
-                      "immagine": shot.get("path", "")}
+        return None, dict(how, **{"errore": "il display del tester e' spento o al buio",
+                                  "buio": True,
+                                  "roi": used,
+                                  "immagine": shot.get("path", "")})
 
     found = parse(text)
     reading, quality = reconcile(found)
 
     if reading is None:
-        return None, {"errore": quality, "letto": found, "roi": used,
-                      "immagine": shot.get("path", "")}
+        return None, dict(how, **{"errore": quality, "letto": found, "roi": used,
+                                  "immagine": shot.get("path", "")})
 
     reading["image"] = shot.get("path", "")
     quality["took_ms"] = shot.get("took_ms")
     quality["roi"] = used
+    quality.update(how)
 
     return reading, quality
 
 
-def measure(device, roi, dry_run=False, retries=1):
+def measure(device, roi, dry_run=False, retries=1, transport=TRANSPORT):
     """La lettura buona, riscattando una volta se la prima non convince.
 
     Il secondo tentativo esiste perche' il caso piu' frequente e' banale: una
@@ -721,7 +895,7 @@ def measure(device, roi, dry_run=False, retries=1):
     problems = []
 
     for attempt in range(retries + 1):
-        reading, quality = capture(device, roi, dry_run)
+        reading, quality = capture(device, roi, dry_run, transport)
 
         if reading:
             quality["tentativi"] = attempt + 1
@@ -786,6 +960,8 @@ def measure(device, roi, dry_run=False, retries=1):
             "fonte": "display spento",
             "buio": True,
             "tentativi": len(problems),
+            "trasporto": problems[-1].get("trasporto", ""),
+            "ripiego": problems[-1].get("ripiego", ""),
         }
 
     return None, {"errore": "lettura non affidabile", "tentativi": problems}
@@ -794,7 +970,8 @@ def measure(device, roi, dry_run=False, retries=1):
 # --------------------------------------------------------------------- main
 
 
-def run(device, roi, dry_run=False, force=False, from_text="", min_elevation=MIN_ELEVATION):
+def run(device, roi, dry_run=False, force=False, from_text="",
+        min_elevation=MIN_ELEVATION, transport=TRANSPORT):
     # Il testo finto serve alle prove: si controlla il parser e i vincoli
     # senza chiedere niente al telefono, e soprattutto si puo' provare una
     # lettura sbagliata, che dal vero non si sa come farsi dare.
@@ -819,19 +996,45 @@ def run(device, roi, dry_run=False, force=False, from_text="", min_elevation=MIN
             # Nessuno scatto e nessun errore: di notte non c'e' niente da
             # misurare, e svegliare il telefono ogni dieci minuti per
             # fotografare uno zero sarebbe solo usura.
-            return {
+            #
+            # Ma il giorno cambia anche di notte: il primo tick dopo la
+            # mezzanotte riapre la giornata qui, senza fotografia, cosi' la
+            # finestra e' 0:00-24:00 netta e il sensore non porta la raccolta
+            # di ieri fino all'alba.
+            payload = {
                 "ok": True,
                 "skipped": "sole troppo basso (%.1f°)" % elevation,
                 "elevation": elevation,
             }
 
-    reading, quality = measure(device, roi, dry_run)
+            if midnight_roll(sky, dry_run):
+                payload["giorno"] = "ricominciato"
+
+            return payload
+
+    reading, quality = measure(device, roi, dry_run, transport=transport)
+
+    # Prima di pubblicare, il sospetto: un contatore che scende mentre il
+    # cronometro del tester avanza non e' un azzeramento, e' una lettura
+    # troncata dall'OCR. Il secondo scatto quasi sempre legge bene — fuoco e
+    # luce cambiano da un istante all'altro, e il giro delle 14:41 del 25
+    # agosto aveva corretto da solo al tentativo dopo. Se tronca anche lui si
+    # butta il campione: la giornata resta dov'e', e il buco di dieci minuti
+    # nel grafico costa meno della giornata rispazzata via.
+    if counter_suspect((reading or {}).get("carica"), quality):
+        reading, quality = measure(device, roi, dry_run, transport=transport)
+
+        if counter_suspect((reading or {}).get("carica"), quality):
+            reason = "contatore mAh in calo col cronometro del tester che invece avanzava"
+            count_discard(reason, dry_run)
+            return {"ok": False, "scartata": True, "motivo": {"errore": reason}}
 
     if reading is None:
         count_discard(str(quality.get("errore", "")), dry_run)
         return {"ok": False, "scartata": True, "motivo": quality}
 
-    sent = publish(reading, sky, dry_run, quality.get("buio", False))
+    sent = publish(reading, sky, dry_run, quality.get("buio", False),
+                   tempo_seconds(quality.get("tempo_tester")))
 
     return {
         "ok": sent.get("ok", False),
@@ -850,17 +1053,30 @@ def main():
     parser.add_argument("--device", default=DEFAULT_DEVICE, help="quale telefono fotografa")
     parser.add_argument("--roi", default="",
                         help="forza il rettangolo per questo scatto; vuoto = "
-                             "quello che ha il telefono (riquadralo col mirino: "
-                             "phone_adb.py aim)")
+                             "quello che ha il telefono (si riquadra trascinandolo "
+                             "sull'anteprima nel pannello del browser, o col "
+                             "mirino di phone_adb.py aim sulla strada vecchia)")
     parser.add_argument("--dry-run", action="store_true", help="legge e stampa, senza scrivere in HA")
     parser.add_argument("--force", action="store_true", help="scatta anche col sole basso")
     parser.add_argument("--from-text", default="", help="interpreta questo testo invece di scattare")
     parser.add_argument("--min-elevation", type=float, default=MIN_ELEVATION,
                         help="altezza del sole sotto la quale non si scatta (default: alba/tramonto)")
+    parser.add_argument("--transport", default=TRANSPORT, choices=["auto", "web", "adb"],
+                        help="come si chiede la foto: web = MacroCam Web in HTTP, "
+                             "adb = l'app di prima col debug wireless, auto = la "
+                             "prima e in mancanza la seconda (default: auto)")
     args = parser.parse_args()
 
-    payload = run(args.device, args.roi, args.dry_run, args.force, args.from_text,
-                  args.min_elevation)
+    try:
+        payload = run(args.device, args.roi, args.dry_run, args.force, args.from_text,
+                      args.min_elevation, args.transport)
+    finally:
+        # La camera che abbiamo aperto la richiudiamo, che la lettura sia
+        # riuscita o no. In un `finally` perche' i modi di uscire da run() sono
+        # cinque — sole basso, scatto fallito, lettura scartata, contatore
+        # sospetto, tutto a posto — e ricordarsene in tutti e cinque e' il
+        # genere di cosa che si dimentica nel sesto.
+        macrocam_web.tidy()
 
     print(json.dumps(payload, ensure_ascii=False, indent=2 if sys.stdout.isatty() else None))
 

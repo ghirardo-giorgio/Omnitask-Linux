@@ -121,6 +121,15 @@ Singleton {
     // stato" vuol dire "non lo so ancora", che non e' "non collegato".
     property bool linksKnown: false
 
+    // Il telefono che il pannello sta collegando adesso, "" quando nessuno.
+    // Il nome e non un `busy`: nel pannello le icone sono una per telefono, e
+    // un booleano solo le farebbe girare tutte insieme.
+    property string connecting: ""
+
+    // Com'e' andata. Il pannello lo scrive nella riga di quel telefono, dove
+    // gia' finiscono gli esiti degli appunti.
+    signal connectDone(string device, bool ok, string text)
+
     // I soli nomi, per chi deve farne una scelta. `links` non basta: ha per
     // chiave anche gli indirizzi, e un selettore con dentro "192.168.50.134"
     // accanto a "moto g24" chiederebbe di scegliere due volte lo stesso
@@ -225,6 +234,24 @@ Singleton {
         root.push(["--device", root.device, "connect"], "connect");
         // Dopo il collegamento lo stato e' un altro, e con esso i pulsanti.
         root.refresh();
+    }
+
+    // Lo stesso comando, ma per un telefono che non e' quello della finestra.
+    //
+    // Il pannello li elenca tutti insieme, e passare dalla coda vorrebbe dire
+    // assegnare `device`, cioe' spostare la finestra sul telefono di cui si e'
+    // toccata l'icona. Fuori dalla coda, quindi, come `peek`.
+    //
+    // Uno per volta lo stesso: `adb connect` riscrive la cache delle porte, e
+    // due processi che la riscrivono insieme la lascerebbero a meta'.
+    function connectPhone(name: string): void {
+        if (name === "" || connector.running)
+            return;
+
+        connector.device = name;
+        connector.command = [...root.runner, "--device", name, "connect"];
+        root.connecting = name;
+        connector.running = true;
     }
 
     // Rimette in gioco un telefono che ha tolto l'autorizzazione. Quale delle
@@ -430,6 +457,49 @@ Singleton {
                 root.links = map;
                 root.phones = names;
                 root.linksKnown = true;
+            }
+        }
+    }
+
+    // Il `connect` chiesto dal pannello. Fuori dalla coda per la stessa ragione
+    // di `peeker`: la coda e' del telefono che si sta guardando nella finestra.
+    Process {
+        id: connector
+
+        property string device: ""
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                let data;
+
+                try {
+                    data = JSON.parse(this.text);
+                } catch (e) {
+                    // Uno script che muore senza dire niente e' un tentativo
+                    // fallito come un altro: la riga lo dira' con le stesse
+                    // parole invece di lasciare l'icona a girare per sempre.
+                    data = null;
+                }
+
+                const ok = !!(data && data.ok);
+                // La frase buona sta in tre posti diversi a seconda di com'e'
+                // andata: l'errore del primo tentativo quando ha bussato
+                // invano, la nota generale quando non c'era niente da fare.
+                const first = data && data.results && data.results.length > 0 ? data.results[0] : null;
+                const text = ok ? I18n.t("collegato")
+                    : (first && (first.hint || first.error))
+                    || (data && (data.note || data.error))
+                    || I18n.t("non riuscito");
+
+                root.connecting = "";
+                root.connectDone(connector.device, ok, text);
+
+                // I pallini del pannello dicono ancora com'era prima.
+                root.peek();
+
+                // Se e' anche quello della finestra, li' cambiano i pulsanti.
+                if (connector.device === root.device)
+                    root.refresh();
             }
         }
     }

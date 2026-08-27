@@ -95,6 +95,9 @@ import zlib
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -173,6 +176,11 @@ def adb(*args, binary=False, timeout=TIMEOUT):
     return done.returncode == 0, done.stdout, err.strip()
 
 
+def unescape(raw):
+    """Il nome di un servizio mDNS come lo si legge, non come lo scrive avahi."""
+    return re.sub(r"\\(\d{3})", lambda m: chr(int(m.group(1))), raw or "")
+
+
 def browse(*services, seconds=2.5):
     """I servizi mDNS visti in una finestra di ascolto: {tipo: [{"ip", "port"}]}.
 
@@ -236,7 +244,15 @@ def browse(*services, seconds=2.5):
                 continue
 
             seen.add(entry)
-            found[service].append({"ip": parts[7], "port": int(parts[8]), "host": parts[6]})
+            found[service].append({
+                "ip": parts[7],
+                "port": int(parts[8]),
+                "host": parts[6],
+                # Il nome annunciato, con le fughe di avahi sciolte: gli spazi
+                # viaggiano come \032 e un telefono che si chiama
+                # "HealthBridge\032Pixel" non lo riconosce nessuno.
+                "name": unescape(parts[3]),
+            })
 
     return found
 
@@ -2571,189 +2587,316 @@ def do_aim(mode="macro", target=""):
 # -------------------------------------------------------------- healthbridge
 
 # L'app che legge Health Connect: sta in un progetto a parte, qui se ne
-# conoscono solo il nome e il punto d'ingresso. Come MacroCam non e' una
+# conoscono solo il nome del servizio e il vocabolario. Come MacroCam non e' una
 # dipendenza — se non c'e', tutto il resto continua a funzionare e questo lo
 # dice.
-HEALTH = "com.oberon.healthbridge"
-HEALTH_FILES = "/sdcard/Android/data/%s/files" % HEALTH
+#
+# Non passa piu' da adb. Il telefono tiene aperta una porta sulla rete di casa e
+# risponde a chiunque abbia la chiave: qui dentro non c'e' piu' un `am
+# broadcast` da cui rubare il JSON fra virgolette che nessuno protegge, ne' la
+# danza del contatore che serviva a rendere sincrona una chiamata cieca. Il
+# cavo serve ancora per installare l'APK, e per nient'altro.
+HEALTH_SERVICE = "_healthbridge._tcp"
 
-HEALTH_READS = [
-    "READ_HEART_RATE", "READ_STEPS", "READ_SLEEP", "READ_DISTANCE",
-    "READ_TOTAL_CALORIES_BURNED", "READ_ACTIVE_CALORIES_BURNED",
-    "READ_SKIN_TEMPERATURE", "READ_OXYGEN_SATURATION", "READ_WEIGHT",
-    "READ_HEALTH_DATA_IN_BACKGROUND",
-]
+# La versione del vocabolario che questo file sa leggere. L'app la annuncia nel
+# TXT di mDNS e la ripete in /api/ping: se un giorno non combaciano, e' cambiata
+# la forma delle risposte e va riletto il README invece di indovinare quale
+# chiave sia sparita.
+HEALTH_API = 1
 
-HEALTH_MISSING = (
-    "HealthBridge non e' installata su questo telefono. Dal progetto "
-    "~/Documents/Development/Android/healthbridge: `./gradlew assembleDebug`, "
-    "poi `adb -s SERIAL install -r app/build/outputs/apk/debug/app-debug.apk` e "
-    "`phone_adb.py health-grant`"
+# Due file e non uno, perche' sono due cose diverse. La chiave e'
+# configurazione: si registra a mano una volta, e se sparisce va riscritta.
+# L'indirizzo e' cache: se sparisce lo ritrova mDNS da solo, ci si rimette
+# l'attesa dell'ascolto.
+HEALTH_TOKEN_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "quickshell",
+    "healthbridge.json",
+)
+
+HEALTH_CACHE = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+    "quickshell",
+    "healthbridge.json",
+)
+
+HEALTH_NO_TOKEN = (
+    "manca la chiave di HealthBridge. Aprila sul telefono, leggi la chiave "
+    "sotto l'indirizzo (o dal QR), poi: `phone_adb.py health-pair LA_CHIAVE`"
+)
+
+HEALTH_NOT_FOUND = (
+    "nessun HealthBridge sulla rete. Aprila sul telefono e premi «Avvia il "
+    "server»; se e' gia' acceso, controlla che telefono e PC siano sulla "
+    "stessa rete WiFi"
+)
+
+HEALTH_OTHER_NAME = (
+    "nessun HealthBridge che si chiami «%s»: sulla rete c'e' %s. Scegli quel "
+    "telefono nelle opzioni del battito, oppure lascia AUTO"
+)
+
+HEALTH_REFUSED = (
+    "«%s» e' sulla rete ma la porta e' chiusa: il server si e' fermato. "
+    "Riaprilo dalla schermata dell'app"
+)
+
+HEALTH_DENIED = (
+    "la chiave non e' quella giusta: e' stata rigenerata sul telefono. "
+    "Rileggila dall'app e ridalla con `phone_adb.py health-pair LA_CHIAVE`"
 )
 
 
-# Un telefono che adb elenca non e' un telefono che risponde: una sessione
-# wireless stantia resta scritta in `adb devices` come "device" e fallisce a
-# ogni comando con "error: closed". La differenza conta proprio qui, perche' un
-# `pm list packages` che non arriva torna vuoto esattamente come quello di un
-# telefono senza l'app — e mandare a ricompilare un APK per un debug wireless
-# spento e' il genere di consiglio che fa perdere un pomeriggio.
-HEALTH_UNREACHABLE = (
-    "«%s» non risponde ad adb: la sessione e' caduta. Riaccendi il debug "
-    "wireless sul telefono (Opzioni sviluppatore → Debug wireless), poi apri la "
-    "sua finestra e premi Collega"
-)
+def health_read(path):
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
 
 
-def health_probe(device):
-    """(l'app c'e', perche' non si sa). Le due cose non si deducono l'una dall'altra."""
-    ok, out, err = shell(device, "shell", "pm", "list", "packages", HEALTH)
+def health_write(path, data):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
 
-    if not ok:
-        return False, HEALTH_UNREACHABLE % (device["name"] or device["serial"])
+        with open(path, "w") as handle:
+            json.dump(data, handle)
+    except OSError:
+        pass
 
-    return HEALTH in (out or ""), ""
+
+def health_token():
+    return (health_read(HEALTH_TOKEN_FILE).get("token") or "").strip()
 
 
-def health_status(device):
-    ok, out, _ = shell(device, "shell", "cat", HEALTH_FILES + "/status.json")
+# Il telefono ha due nomi, e non e' colpa di nessuno dei due. Adb lo chiama col
+# modello — «moto g24» — mentre HealthBridge si annuncia col proprio, che quel
+# modello se lo porta dietro dopo il nome dell'app: «HealthBridge moto g24». Chi
+# sceglie il telefono nelle opzioni della dashboard sceglie dalla lista di adb,
+# e confrontare le due stringhe per uguaglianza vuol dire che quella scelta non
+# combacia mai — cioe' che il selettore fatto per distinguere due telefoni
+# spegne la lettura appena lo si usa, dicendo che sulla rete non c'e' nessuno
+# mentre il telefono risponde.
+def health_alias(name):
+    """Il nome del telefono dentro il nome del servizio."""
+    text = (name or "").strip()
 
-    if not ok or not out:
-        return None
+    if text.lower().startswith("healthbridge"):
+        text = text[len("healthbridge"):].strip(" -_")
+
+    return text.casefold()
+
+
+def health_others(target):
+    """I HealthBridge che ci sono, quando quello chiesto non si trova.
+
+    Costa un altro ascolto della rete e lo si spende solo qui, dentro il ramo
+    dell'errore: la scelta e' fra due secondi e mezzo e un messaggio che dice
+    «non c'e' nessuno» mentre ce n'e' uno che si chiama soltanto in un altro
+    modo — ed e' un messaggio che manda a controllare il WiFi per un'ora.
+    """
+    if not target:
+        return []
+
+    found = browse(HEALTH_SERVICE).get(HEALTH_SERVICE) or []
+
+    return [f.get("name", "") for f in found if f.get("name")]
+
+
+def health_find(name=""):
+    """Il telefono che si annuncia, chiesto alla rete.
+
+    Costa i due secondi e mezzo di ascolto di `browse`, ed e' il motivo per cui
+    non lo si fa a ogni giro: la dashboard chiede una volta al minuto, e
+    ascoltare la rete ogni volta costerebbe piu' della lettura che si va a
+    fare. Da qui si passa solo quando l'indirizzo in cache non risponde piu'.
+    """
+    found = browse(HEALTH_SERVICE).get(HEALTH_SERVICE) or []
+
+    if name:
+        wanted = health_alias(name)
+        found = [f for f in found if health_alias(f.get("name")) == wanted]
+
+    return found[0] if found else None
+
+
+def health_where(target="", fresh=False):
+    """Dove bussare: (indirizzo, porta, nome) oppure (None, None, None).
+
+    Tre gradini in ordine di costo. L'ambiente vince su tutto perche' e' una
+    scelta esplicita di chi lancia il comando; poi la cache, che non costa
+    niente; poi la rete. Un indirizzo in cache che non risponde piu' non e' un
+    problema: chi chiama riprova con `fresh` e si passa da mDNS.
+    """
+    forced = os.environ.get("HEALTHBRIDGE_HOST")
+
+    if forced:
+        host, _, port = forced.partition(":")
+        return host, int(port or 8421), ""
+
+    cached = health_read(HEALTH_CACHE)
+
+    if not fresh and cached.get("host") and (
+        not target or health_alias(cached.get("name")) == health_alias(target)
+    ):
+        return cached["host"], cached.get("port", 8421), cached.get("name", "")
+
+    seen = health_find(target)
+
+    if not seen:
+        return None, None, None
+
+    cached.update({"host": seen["ip"], "port": seen["port"], "name": seen.get("name", "")})
+    health_write(HEALTH_CACHE, cached)
+
+    return seen["ip"], seen["port"], seen.get("name", "")
+
+
+def health_get(host, port, path, params=None, timeout=45):
+    """Una richiesta e la sua risposta: (dati, errore, codice).
+
+    Il codice torna insieme al resto perche' i tre modi di fallire vogliono tre
+    frasi diverse: un 403 e' una chiave da rifare, un rifiuto di connessione e'
+    un server spento, e un timeout e' un telefono che sta ancora leggendo.
+    """
+    query = dict(params or {})
+    query["t"] = health_token()
+
+    url = "http://%s:%d%s?%s" % (host, port, path, urllib.parse.urlencode(query))
 
     try:
-        return json.loads(out)
-    except ValueError:
-        return None
+        with urllib.request.urlopen(url, timeout=timeout) as answer:
+            return json.loads(answer.read().decode("utf-8")), "", answer.status
+    except urllib.error.HTTPError as problem:
+        body = {}
+
+        try:
+            body = json.loads(problem.read().decode("utf-8"))
+        except (ValueError, OSError):
+            pass
+
+        return None, body.get("error") or "", problem.code
+    except (urllib.error.URLError, OSError, ValueError) as problem:
+        return None, str(getattr(problem, "reason", problem)), 0
 
 
-# `am broadcast` stampa il risultato del receiver su una riga sua, fra
-# virgolette che non protegge: il JSON dentro ha le proprie e nessuno le
-# raddoppia, quindi non si puo' cercare la prima virgoletta di chiusura — si
-# prende tutto fino all'ultima.
-BROADCAST_DATA = 'data="'
+def health_asleep():
+    """«Dorme fino alle sette», se e' cosi'.
 
-
-def broadcast_payload(out):
-    """Il JSON dentro la risposta di `am broadcast`, se c'e'."""
-    where = (out or "").find(BROADCAST_DATA)
-
-    if where < 0:
-        return None
-
-    raw = out[where + len(BROADCAST_DATA):].strip()
-
-    if raw.endswith('"'):
-        raw = raw[:-1]
-
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return None
-
-
-def health_ask(device, action, extras=(), timeout=45):
-    """Una domanda all'app e la sua risposta.
-
-    Passa da un broadcast e non da `am start` perche' un receiver non e'
-    un'activity: non entra nella pila delle applicazioni, non prende il fuoco e
-    non ha niente a che vedere con cio' che c'e' a schermo — l'app che si sta
-    usando resta dov'e', e il telefono addormentato resta addormentato. In piu'
-    `am broadcast` riporta il risultato al chiamante, mentre `am start` non
-    riporta niente: e' quello che fa sparire la danza del contatore e del file
-    riletto finche' il numero non cambia.
-
-    L'activity resta come ripiego, per le due volte in cui serve: una lettura
-    piu' lunga di quanto un receiver possa vivere — oltre la decina di secondi
-    Android lo chiude — e il sospetto che sia il receiver stesso a non
-    rispondere. Li' si torna a guardare `status.json`, che l'app scrive
-    comunque.
-
-    Una lettura costa cinque o sei secondi, quasi tutti spesi a collegarsi a
-    Health Connect: non dipende da quanti minuti si chiedono.
+    E' la sola ragione per cui la fascia oraria si tiene in cache: un telefono
+    che non risponde alle due di notte e uno rotto si assomigliano molto, e
+    mandare qualcuno a cercare un guasto che non c'e' e' il genere di
+    suggerimento che fa perdere una serata.
     """
-    args = [
-        "shell", "am", "broadcast",
-        "-a", HEALTH + ".READ", "-n", HEALTH + "/.ReadReceiver",
-        "--es", "action", action,
-    ]
+    plan = health_read(HEALTH_CACHE).get("schedule") or {}
 
-    for key, value in extras:
-        args += ["--es", key, str(value)]
+    if not plan.get("quiet"):
+        return ""
 
-    ok, out, err = shell(device, *args, timeout=timeout)
-    status = broadcast_payload(out) if ok else None
+    start, end = plan.get("from"), plan.get("to")
 
-    if status is None:
-        return health_ask_slowly(device, action, extras, timeout, err or "")
+    if not start or not end:
+        return ""
 
-    if status.get("state") != "ok":
-        return None, status.get("error") or "la lettura e' fallita"
+    now = time.strftime("%H:%M")
+    quiet = start <= now < end if start < end else (now >= start or now < end)
 
-    return status, ""
+    return "HealthBridge dorme fino alle %s (fascia %s-%s)" % (end, start, end) if quiet else ""
 
 
-def health_ask_slowly(device, action, extras, timeout, why):
-    """La stessa domanda per la via lunga: l'activity, e il file riletto.
+def health_trouble(err):
+    """L'errore pronto da mostrare, con dentro cosa serve per rimediare.
 
-    `am start` non aspetta la fine di niente e non restituisce niente, quindi
-    si legge il contatore prima, si lancia, e si guarda il file finche' il
-    numero non e' cambiato — la stessa danza di `do_photo`.
+    `need` esiste perche' chi disegna non deve leggere il messaggio per capire
+    cosa fare: un errore di chiave si rimedia con un campo di testo, uno di
+    telefono spento no, e distinguerli confrontando stringhe italiane sarebbe
+    un vincolo fra la traduzione di questo file e il codice di un altro.
     """
-    before = (health_status(device) or {}).get("seq", 0)
+    out = {"ok": False, "error": err}
 
-    args = ["shell", "am", "start", "-n", HEALTH + "/.ReadActivity", "--es", "action", action]
+    if err in (HEALTH_NO_TOKEN, HEALTH_DENIED):
+        out["need"] = "token"
 
-    for key, value in extras:
-        args += ["--es", key, str(value)]
-
-    started, _, err = shell(device, *args, timeout=30)
-
-    if not started:
-        return None, (why or err or "l'app non ha risposto")
-
-    deadline = time.time() + timeout
-
-    while time.time() < deadline:
-        fresh = health_status(device)
-
-        if fresh and fresh.get("seq", 0) > before and fresh.get("state") != "busy":
-            if fresh.get("state") != "ok":
-                return None, fresh.get("error") or "la lettura e' fallita"
-
-            return fresh, ""
-
-        time.sleep(0.4)
-
-    return None, "la lettura non ha risposto entro %d secondi" % timeout
+    return out
 
 
-def health_open(target):
-    """Il telefono scelto, gia' controllato che abbia l'app: lo fanno in cinque.
+def health_ask(action, params=None, target="", timeout=45):
+    """Una domanda al telefono e la sua risposta: (dati, errore).
 
-    Il secondo valore e' la risposta d'errore gia' pronta, non il solo motivo:
-    quando i telefoni collegati sono piu' d'uno serve portarsi dietro anche i
-    loro nomi, perche' chi chiede possa farne dei pulsanti invece di stampare
-    una parentesi in fondo a una frase che dice di usare `--device`.
+    Ritenta una volta sola, e solo dopo aver ricontrollato l'indirizzo su mDNS:
+    l'IP di un telefono cambia da solo a ogni rinnovo del DHCP, e una cache
+    stantia e' la causa piu' comune di un silenzio. Oltre a quello non si
+    insiste — se il secondo tentativo con l'indirizzo appena scoperto non passa,
+    il motivo e' un altro e riprovare non lo cambia.
     """
-    view = devices_view(discover=False)
-    device, why = pick(view, target)
+    if not health_token():
+        return None, HEALTH_NO_TOKEN
 
-    if not device:
-        problem = {"ok": False, "error": why}
-        names = [d["name"] or d["serial"] for d in view if d["connected"]]
+    for fresh in (False, True):
+        host, port, name = health_where(target, fresh=fresh)
 
-        if not target and len(names) > 1:
-            problem["choices"] = names
+        if not host:
+            asleep = health_asleep()
 
-        return None, problem
+            if asleep:
+                return None, asleep
 
-    installed, why = health_probe(device)
+            # «Non c'e' nessuno» e «non c'e' quello» portano a due gesti
+            # diversi, e il primo detto al posto del secondo manda a
+            # controllare il WiFi di una casa dove il WiFi funziona.
+            others = health_others(target)
 
-    if not installed:
-        return None, {"ok": False, "error": why or HEALTH_MISSING}
+            if others:
+                return None, HEALTH_OTHER_NAME % (
+                    target, ", ".join("«%s»" % name for name in others))
 
-    return device, {}
+            return None, HEALTH_NOT_FOUND
+
+        data, why, code = health_get(host, port, "/api/" + action, params, timeout)
+
+        if data is not None:
+            health_remember(host, port)
+            return (data, "") if data.get("state") == "ok" else (
+                None, data.get("error") or "la lettura e' fallita"
+            )
+
+        if code == 403:
+            return None, HEALTH_DENIED
+
+        # Un errore che non e' di raggiungibilita' non migliora cambiando
+        # indirizzo: il telefono ha risposto, e ha risposto cosi'.
+        if code:
+            return None, why or "il telefono ha risposto %d" % code
+
+    return None, health_asleep() or (HEALTH_REFUSED % (name or host) if host else HEALTH_NOT_FOUND)
+
+
+def health_remember(host, port):
+    """La fascia oraria, riletta di rado.
+
+    Cambia quando qualcuno la cambia sul telefono, cioe' quasi mai: rileggerla a
+    ogni giro sarebbe una richiesta al minuto per un dato che vale giorni. Sei
+    ore sono abbastanza spesso da accorgersi di una modifica prima della notte
+    successiva, che e' l'unico momento in cui serve.
+    """
+    cached = health_read(HEALTH_CACHE)
+    now = int(time.time())
+
+    if now - cached.get("schedule_at", 0) < 6 * 3600:
+        return
+
+    plan, _, _ = health_get(host, port, "/api/schedule", timeout=5)
+
+    if plan:
+        cached["schedule"] = plan
+        cached["schedule_at"] = now
+        health_write(HEALTH_CACHE, cached)
+
+
+def health_name(target=""):
+    """Come chiamare il telefono nelle risposte: il nome annunciato, o l'indirizzo."""
+    cached = health_read(HEALTH_CACHE)
+    return cached.get("name") or cached.get("host") or target or "telefono"
 
 
 def do_heart(target="", minutes=60, bucket=60, raw=False):
@@ -2765,24 +2908,19 @@ def do_heart(target="", minutes=60, bucket=60, raw=False):
     non c'e'. Senza, la linea salterebbe il buco unendo i due estremi, e mezz'ora
     col braccialetto sul comodino sembrerebbe mezz'ora di battito.
     """
-    device, problem = health_open(target)
-
-    if not device:
-        return problem
-
-    extras = [("minutes", minutes), ("bucket", bucket)]
+    params = {"minutes": minutes, "bucket": bucket}
 
     if raw:
-        extras.append(("raw", "on"))
+        params["raw"] = "on"
 
-    status, err = health_ask(device, "heart", extras)
+    status, err = health_ask("heart", params, target)
 
     if not status:
-        return {"ok": False, "error": err}
+        return health_trouble(err)
 
     out = {
         "ok": True,
-        "device": device["name"] or device["serial"],
+        "device": health_name(target),
         "minutes": minutes,
         "now": status.get("now"),
         "latest": status.get("latest"),
@@ -2821,17 +2959,12 @@ def do_heart(target="", minutes=60, bucket=60, raw=False):
 
 def do_today(target=""):
     """Passi, calorie, sonno e il resto della giornata, come li ha Health Connect."""
-    device, problem = health_open(target)
-
-    if not device:
-        return problem
-
-    status, err = health_ask(device, "today")
+    status, err = health_ask("today", target=target)
 
     if not status:
-        return {"ok": False, "error": err}
+        return health_trouble(err)
 
-    out = {"ok": True, "device": device["name"] or device["serial"]}
+    out = {"ok": True, "device": health_name(target)}
 
     for key in (
         "now", "since", "steps", "distanceMeters", "calories", "activeCalories",
@@ -2849,19 +2982,14 @@ def do_vitals(target=""):
     il dato non c'e' perche' l'app ponte non lo sa leggere, o perche' Fitbit non
     lo ha mai scritto? La riga `origins` dice chi lo ha messo li'.
     """
-    device, problem = health_open(target)
-
-    if not device:
-        return problem
-
-    status, err = health_ask(device, "probe")
+    status, err = health_ask("probe", target=target)
 
     if not status:
-        return {"ok": False, "error": err}
+        return health_trouble(err)
 
     return {
         "ok": True,
-        "device": device["name"] or device["serial"],
+        "device": health_name(target),
         "sdk": status.get("sdk"),
         "now": status.get("now"),
         "granted": status.get("granted"),
@@ -2870,39 +2998,89 @@ def do_vitals(target=""):
     }
 
 
-def do_health_grant(target=""):
-    """I permessi di lettura all'app ponte, uno per uno.
+def do_health_key():
+    """La chiave registrata su questo PC, senza chiedere niente al telefono.
 
-    Su questo telefono `pm grant` basta: i permessi health sono `dangerous` ma
-    non ristretti. Dove non bastasse, la strada e' quella di MacroCam — aprire
-    l'app e toccare il dialogo con `tap-text` — e il suggerimento lo dice.
+    Serve a chi disegna una schermata di impostazioni: quella si apre quando
+    l'utente vuole, non quando qualcosa e' andato storto, e senza questo
+    l'unico modo di sapere se una chiave c'e' sarebbe provocare l'errore che
+    la reclama.
+
+    Torna la chiave e non un si'/no perche' il caso che si viene a risolvere
+    qui e' quasi sempre «l'ho rigenerata sul telefono»: senza vedere quella
+    vecchia non si puo' dire se e' cambiata. Mascherarla non proteggerebbe
+    niente — sta in chiaro sullo schermo da cui la si copia, nel QR che le sta
+    accanto e in ogni indirizzo che questo file costruisce.
+
+    `ok` resta vero anche quando non c'e' niente: «non c'e' nessuna chiave» e'
+    una risposta, non un guasto, e chi chiama la distingue da `saved`.
     """
-    device, problem = health_open(target)
-
-    if not device:
-        return problem
-
-    done, failed = [], {}
-
-    for name in HEALTH_READS:
-        ok, out, err = shell(
-            device, "shell", "pm", "grant", HEALTH, "android.permission.health." + name,
-        )
-        trouble = (err or out or "").strip()
-
-        if ok and not trouble:
-            done.append(name)
-        else:
-            failed[name] = trouble or "rifiutato"
+    token = health_token()
 
     return {
-        "ok": not failed,
-        "device": device["name"] or device["serial"],
-        "granted": done,
-        "failed": failed,
-        "hint": "" if not failed else (
-            "questi vanno concessi a mano: `launch %s`, poi `screen` per "
-            "leggere le etichette e `tap-text` per toccarle" % HEALTH
+        "ok": True,
+        "saved": bool(token),
+        "token": token,
+        "file": HEALTH_TOKEN_FILE,
+    }
+
+
+def do_health_pair(token):
+    """La chiave, registrata una volta per tutte.
+
+    Ha preso il posto di `health-grant`, che concedeva i permessi con `adb shell
+    pm grant` uno per uno. Quei permessi adesso li chiede l'app a se stessa, dal
+    dialogo di Health Connect, e li chiede tutti quelli che dichiara nel
+    manifest: le due liste che divergevano — quattordici nel manifest, dieci qui
+    dentro, e quattro negati per settimane senza che niente lo dicesse — adesso
+    sono una sola.
+    """
+    token = (token or "").strip()
+
+    if not token:
+        return {"ok": False, "error": "serve la chiave, quella scritta sotto l'indirizzo nell'app"}
+
+    health_write(HEALTH_TOKEN_FILE, {"token": token})
+
+    # Provata subito: una chiave salvata e sbagliata sarebbe un errore che
+    # ricompare al prossimo giro della dashboard, lontano da chi l'ha scritta.
+    #
+    # Prima la rete e poi la cache, non solo la rete: un telefono che risponde
+    # ma non si annuncia esiste — succede quando il multicast dorme — e
+    # rifiutare la chiave a chi e' perfettamente raggiungibile sarebbe un no
+    # che non si sa spiegare.
+    host, port, name = health_where(fresh=True)
+
+    if not host:
+        host, port, name = health_where(fresh=False)
+
+    if not host:
+        return {
+            "ok": True,
+            "saved": HEALTH_TOKEN_FILE,
+            "note": "chiave salvata, ma il telefono non si annuncia adesso: " + HEALTH_NOT_FOUND,
+        }
+
+    data, why, code = health_get(host, port, "/api/ping", timeout=10)
+
+    if code == 403:
+        return {"ok": False, "error": HEALTH_DENIED}
+
+    if not data:
+        return {"ok": False, "error": why or "il telefono non ha risposto"}
+
+    health_remember(host, port)
+
+    return {
+        "ok": True,
+        "saved": HEALTH_TOKEN_FILE,
+        "device": name or host,
+        "address": "%s:%d" % (host, port),
+        "api": data.get("api"),
+        "note": (
+            "" if data.get("api") == HEALTH_API else
+            "attenzione: l'app parla la versione %s dell'API e questo script la %d"
+            % (data.get("api"), HEALTH_API)
         ),
     }
 
@@ -3093,7 +3271,13 @@ def main():
     # sistema, e due nomi uguali per cose diverse sono un errore di lettura in
     # attesa di succedere.
     sub.add_parser("vitals", help="cosa c'e' in Health Connect e quanto e' fresco")
-    sub.add_parser("health-grant", help="concede i permessi di lettura all'app ponte")
+
+    # `health-grant` non c'e' piu': i permessi adesso l'app se li chiede da
+    # sola, e quello che serve dal PC e' solo la chiave per entrare.
+    pair = sub.add_parser("health-pair", help="registra la chiave di HealthBridge")
+    pair.add_argument("token", help="la chiave scritta nell'app, o letta dal QR")
+
+    sub.add_parser("health-key", help="la chiave di HealthBridge registrata qui")
 
     args = parser.parse_args()
     command = args.command or "status"
@@ -3158,8 +3342,10 @@ def main():
         payload = do_today(args.device)
     elif command == "vitals":
         payload = do_vitals(args.device)
-    elif command == "health-grant":
-        payload = do_health_grant(args.device)
+    elif command == "health-pair":
+        payload = do_health_pair(args.token)
+    elif command == "health-key":
+        payload = do_health_key()
     else:
         payload = {"ok": False, "error": f"comando sconosciuto: {command}"}
 

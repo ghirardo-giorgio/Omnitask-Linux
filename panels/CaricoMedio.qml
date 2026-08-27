@@ -18,6 +18,16 @@ ColumnLayout {
     // Titolo mostrato nelle Opzioni. Senza, si usa il nome del file.
     property string panelTitle: "Carico medio"
 
+    // Anche i valori che prima erano scritti nel codice possono finire nel
+    // file di configurazione, nella sezione "panelParams" di dashboard.json:
+    // qui resta il default, registrato alla prima comparsa del pannello.
+    // La chiave e' l'id del pannello nel catalogo — per un file senza
+    // `panelId` dichiarato, "user:" piu' il nome del file.
+    readonly property var defs: ({ intervalMs: 5000 })
+    readonly property int intervalMs: Settings.panelParam("user:CaricoMedio", "intervalMs", defs.intervalMs)
+
+    Component.onCompleted: Settings.declarePanelParams("user:CaricoMedio", defs)
+
     property var load: [0, 0, 0]
 
     spacing: 6
@@ -34,7 +44,7 @@ ColumnLayout {
 
     Timer {
         running: true
-        interval: 5000
+        interval: Math.max(500, root.intervalMs)
         repeat: true
         triggeredOnStart: true
         onTriggered: loadavg.reload()

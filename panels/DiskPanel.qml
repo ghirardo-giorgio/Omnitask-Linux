@@ -1,10 +1,31 @@
 import QtQuick
 import QtQuick.Layouts
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // I dischi scelti nelle opzioni: per ognuno l'anello dello spazio, i numeri, e
 // l'andamento di lettura e scrittura.
 ColumnLayout {
     id: root
+
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "disks"
+    property string panelTitle: "Dischi"
+
+    // I valori che prima erano scritti nel codice e adesso stanno nel file
+    // di configurazione (sezione "panelParams" di dashboard.json): qui
+    // resta solo il default, che il pannello registra al primo avvio.
+    readonly property var defs: ({ wornPct: 90 })
+    // Percentuale di usura SMART oltre cui il disco conta come in sofferenza.
+    readonly property int wornPct: Settings.panelParam("disks", "wornPct", defs.wornPct)
+
+    Component.onCompleted: Settings.declarePanelParams("disks", defs)
 
     // Solo i montati fra quelli scelti: un disco staccato non deve lasciare una
     // riga vuota, ne' sparire dalle preferenze — quando torna, ricompare.
@@ -52,7 +73,7 @@ ColumnLayout {
             readonly property var probe: SystemStats.diskTemp(disk.modelData.name)
 
             // Un disco che sta morendo lo dice in piu' modi, e basta uno.
-            readonly property bool ailing: disk.smart.passed === false || (disk.smart.realloc ?? 0) > 0 || (disk.smart.pending ?? 0) > 0 || (disk.smart.used ?? 0) >= 90
+            readonly property bool ailing: disk.smart.passed === false || (disk.smart.realloc ?? 0) > 0 || (disk.smart.pending ?? 0) > 0 || (disk.smart.used ?? 0) >= root.wornPct
 
             // Quanto gli resta da vivere, per quel che se ne sa: senza i
             // privilegi per lo SMART resta la sola temperatura, che e' poco ma

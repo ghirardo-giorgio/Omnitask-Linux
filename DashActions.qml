@@ -18,6 +18,9 @@ Singleton {
     signal openHardware
     signal openNetwork
     signal openOptions
+    // La chat di Hermes: il pannello Comando IA la tiene in una finestra a
+    // parte per non fagocitare la colonna della dashboard.
+    signal openHermes
     // Quale telefono aprire: il nome di KDE Connect, che phone_adb.py sa
     // risolvere da solo in indirizzo o serial.
     signal openPhone(string device)

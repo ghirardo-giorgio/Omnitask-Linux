@@ -8,9 +8,16 @@ import Quickshell.Io
 // ~/.config/quickshell/dashboard.json (stesso schema di HomeAssistant.qml:
 // FileView + JsonAdapter, col file creato coi default al primo avvio).
 //
-// Qui vive l'unico elenco di quali pannelli esistono: la dashboard lo usa per
-// costruirsi, la finestra opzioni per farlo modificare. Aggiungere un pannello
-// nuovo in futuro significa scrivere un file in panels/ e una riga nel catalogo.
+// Quale pannello esista non lo dice piu' nessun elenco qui dentro: tutti i
+// pannelli stanno in panels/ e il catalogo e' quello che la scansione trova
+// (vedi UserPanels). Ogni file dichiara il suo `panelId` e il suo
+// `panelTitle`, quindi aggiungere o togliere un modulo significa aggiungere o
+// togliere un file — questo singleton non cambia.
+//
+// Qui vivono invece i valori che i pannelli non vogliono avere scritti nel
+// codice: soglie, intervalli e simili finiscono nella sezione "panelParams"
+// del file (vedi panelParam e declarePanelParams) e si modificano a mano in
+// dashboard.json — che il FileView rilegge da solo mentre gira.
 Singleton {
     id: root
 
@@ -27,112 +34,18 @@ Singleton {
     // disco: i file non possono chiamarsi come i singleton globali (un
     // HomeAssistant.qml oscurerebbe il singleton HomeAssistant).
     //
-    // Il catalogo vero e' `catalog`, qui sotto: questo e' solo la parte di
-    // casa, a cui si aggiungono i pannelli che l'utente ha messo in panels/.
-    readonly property var builtinCatalog: [
-        {
-            id: "homeassistant",
-            title: I18n.t("Home Assistant"),
-            file: "HaPanel"
-        },
-        {
-            id: "cpu",
-            title: I18n.t("CPU"),
-            file: "CpuPanel"
-        },
-        {
-            id: "topcpu",
-            title: I18n.t("Classifica CPU"),
-            file: "TopCpuPanel"
-        },
-        {
-            id: "ram",
-            title: I18n.t("RAM"),
-            file: "RamPanel"
-        },
-        {
-            id: "topram",
-            title: I18n.t("Classifica RAM"),
-            file: "TopRamPanel"
-        },
-        {
-            id: "gpu",
-            title: I18n.t("GPU"),
-            file: "GpuPanel"
-        },
-        {
-            id: "topgpu",
-            title: I18n.t("Classifica GPU"),
-            file: "TopGpuPanel"
-        },
-        {
-            id: "vram",
-            title: I18n.t("VRAM"),
-            file: "VramPanel"
-        },
-        {
-            id: "topvram",
-            title: I18n.t("Classifica VRAM"),
-            file: "TopVramPanel"
-        },
-        {
-            id: "power",
-            title: I18n.t("Consumo"),
-            file: "PowerPanel"
-        },
-        {
-            id: "temps",
-            title: I18n.t("Temperature"),
-            file: "TempPanel"
-        },
-        {
-            id: "pressure",
-            title: I18n.t("Pressione"),
-            file: "PressurePanel"
-        },
-        {
-            id: "health",
-            title: I18n.t("Stato sistema"),
-            file: "HealthPanel"
-        },
-        {
-            id: "disks",
-            title: I18n.t("Dischi"),
-            file: "DiskPanel"
-        },
-        {
-            id: "net",
-            title: I18n.t("Rete"),
-            file: "NetPanel"
-        },
-        {
-            id: "ai",
-            title: I18n.t("Comando IA"),
-            file: "AiPanel"
-        },
-        {
-            id: "phones",
-            title: I18n.t("Telefoni"),
-            file: "PhonePanel"
-        },
-        {
-            id: "heart",
-            title: I18n.t("Battito"),
-            file: "HeartPanel"
-        },
-        {
-            id: "tools",
-            title: I18n.t("Servizi e processi"),
-            file: "ToolsPanel"
-        }
-    ]
-
-    // I pannelli di casa piu' quelli aggiunti dall'utente. In coda e non
-    // mescolati: l'elenco delle Opzioni segue quest'ordine, e i propri si
-    // cercano in fondo, dove li si e' messi.
-    readonly property var catalog: root.builtinCatalog.concat(UserPanels.usable)
+    // Il catalogo e' quello che la scansione di panels/ ha trovato: pannelli
+    // di casa e aggiunti dall'utente sono la stessa cosa, tutti nella stessa
+    // cartella e tutti con le stesse regole (vedi UserPanels e scripts/
+    // panels.py). Finche' la scansione gira il catalogo e' vuoto: la
+    // dashboard tiene gli slot in sospeso invece di dichiararli guasti.
+    readonly property var catalog: UserPanels.usable
 
     readonly property var left: cfg.left
+    // La colonna di mezzo e' l'ultima arrivata e di solito e' vuota: in quel
+    // caso la dashboard non la disegna affatto e resta a due colonne come
+    // prima (vedi Dashboard.qml). Ci si va per scelta, col tasto C.
+    readonly property var center: cfg.center
     readonly property var right: cfg.right
     readonly property var haEntities: cfg.haEntities
     readonly property var haNoChart: cfg.haNoChart
@@ -344,15 +257,21 @@ Singleton {
         return found ? found.file : "";
     }
 
+    // Il titolo arriva dal file (`panelTitle`) e passa da I18n.t come tutte le
+    // scritte: per i pannelli tradotti trova la voce, per quelli dell'utente
+    // resta quello che hanno scritto — una stringa che il dizionario non
+    // conosce torna indietro identica.
     function titleFor(id: string): string {
         const found = root.entry(id);
-        return found ? found.title : id;
+        return found ? I18n.t(found.title) : id;
     }
 
-    // "left", "right", oppure "" se il pannello e' spento.
+    // "left", "center", "right", oppure "" se il pannello e' spento.
     function columnOf(id: string): string {
         if (cfg.left.includes(id))
             return "left";
+        if (cfg.center.includes(id))
+            return "center";
         if (cfg.right.includes(id))
             return "right";
         return "";
@@ -366,6 +285,10 @@ Singleton {
     // vuol dire rimetterlo in fondo a una colonna.
     function toggle(id: string) {
         const column = root.columnOf(id);
+        // Si accende sempre in una delle due colonne laterali, mai in quella di
+        // mezzo: quella vuota sarebbe sempre la piu' corta, e ogni pannello
+        // acceso finirebbe li' senza che nessuno l'abbia chiesto. Al centro ci
+        // si va scegliendo.
         if (column === "")
             root.assign(id, cfg.left.length <= cfg.right.length ? "left" : "right");
         else
@@ -385,7 +308,7 @@ Singleton {
         const column = root.columnOf(id);
         if (column === "")
             return;
-        const list = (column === "left" ? cfg.left : cfg.right).filter(x => x !== id);
+        const list = root.columnList(column).filter(x => x !== id);
         const target = Math.max(0, Math.min(list.length, index));
         list.splice(target, 0, id);
         root.store(column, list);
@@ -399,24 +322,48 @@ Singleton {
         configFile.writeAdapter();
     }
 
-    // Unico punto che tocca le due liste: toglie il pannello da dove sta e, se
+    // La lista di una colonna per nome. Un nome sconosciuto vale la colonna di
+    // destra, che e' dove finiva tutto prima che ce ne fossero tre.
+    function columnList(column: string): var {
+        if (column === "left")
+            return cfg.left;
+        if (column === "center")
+            return cfg.center;
+        return cfg.right;
+    }
+
+    // Unico punto che tocca le tre liste: toglie il pannello da dove sta e, se
     // `column` non e' vuota, lo aggiunge in fondo a quella richiesta.
     function assign(id: string, column: string) {
         const left = cfg.left.filter(x => x !== id);
+        const center = cfg.center.filter(x => x !== id);
         const right = cfg.right.filter(x => x !== id);
         if (column === "left")
             left.push(id);
+        else if (column === "center")
+            center.push(id);
         else if (column === "right")
             right.push(id);
-        root.store("left", left);
-        root.store("right", right);
+        // Una scrittura sola per uno spostamento: le tre liste cambiano
+        // insieme, e salvare tre volte lascerebbe sul disco due stati
+        // intermedi in cui il pannello non sta in nessuna colonna.
+        root.setColumn("left", left);
+        root.setColumn("center", center);
+        root.setColumn("right", right);
+        configFile.writeAdapter();
+    }
+
+    function setColumn(column: string, list: var) {
+        if (column === "left")
+            cfg.left = list;
+        else if (column === "center")
+            cfg.center = list;
+        else
+            cfg.right = list;
     }
 
     function store(column: string, list: var) {
-        if (column === "left")
-            cfg.left = list;
-        else
-            cfg.right = list;
+        root.setColumn(column, list);
         configFile.writeAdapter();
     }
 
@@ -474,6 +421,69 @@ Singleton {
         return root.limits[name] ?? [0, 0];
     }
 
+    // --- parametri dei pannelli -------------------------------------------------
+    //
+    // Ogni pannello decide i propri valori (soglie, intervalli) e non li scrive
+    // nel codice: li legge da qui, che li tiene nella sezione "panelParams" di
+    // dashboard.json. Il default sta nel pannello, che lo dichiara con
+    // declarePanelParams al primo avvio — cosi' il file mostra tutti i valori
+    // modificabili senza che nessuno debba leggere il sorgente per scoprirla.
+    //
+    // La forma e' { id-del-pannello: { nome: valore } }: una sezione per
+    // pannello, chiavi libere. Un valore cancellato a mano dal file torna al
+    // default alla prossima partenza, perche' il pannello lo ridichiara.
+
+    // Legge un parametro del pannello `id`, con il default se non impostato.
+    function panelParam(id: string, key: string, fallback: var): var {
+        const section = cfg.panelParams[id];
+        const value = section ? section[key] : undefined;
+        return value === undefined ? fallback : value;
+    }
+
+    // Scrive un parametro: serve a chi vuole cambiarlo da interfaccia, non solo
+    // a mano col file.
+    function setPanelParam(id: string, key: string, value: var) {
+        const section = Object.assign({}, cfg.panelParams[id] ?? ({}));
+        if (section[key] === value)
+            return;
+        section[key] = value;
+        cfg.panelParams = Object.assign({}, cfg.panelParams, {
+                [id]: section
+            });
+        configFile.writeAdapter();
+    }
+
+    // Registra i default di un pannello: le chiavi che mancano nel file ci
+    // finiscono, quelle che l'utente ha gia' cambiato restano sue. Le scritture
+    // sono rimandate e raccolte: all'avvio i pannelli si dichiarano tutti
+    // insieme, e il file non deve essere riscritto venti volte di fila.
+    function declarePanelParams(id: string, defaults: var) {
+        const existing = cfg.panelParams[id] ?? ({});
+        let changed = false;
+        const merged = Object.assign({}, existing);
+        for (const key in defaults) {
+            if (merged[key] === undefined) {
+                merged[key] = defaults[key];
+                changed = true;
+            }
+        }
+        if (!changed)
+            return;
+        cfg.panelParams = Object.assign({}, cfg.panelParams, {
+                [id]: merged
+            });
+        declareTimer.restart();
+    }
+
+    // La dichiarazione dei default aspetta un attimo prima di toccare il
+    // disco: chi arriva dopo sovrascrive il timer invece del file.
+    Timer {
+        id: declareTimer
+
+        interval: 2000
+        onTriggered: configFile.writeAdapter()
+    }
+
     FileView {
         id: configFile
 
@@ -497,6 +507,10 @@ Singleton {
             id: cfg
 
             property var left: ["homeassistant", "cpu", "topcpu", "ram", "topram"]
+            // Vuota di partenza, e vuota resta per chi aggiorna: una
+            // configurazione scritta prima che questa colonna esistesse non ha
+            // la chiave, e la dashboard parte identica a com'era.
+            property var center: []
             property var right: ["gpu", "topgpu", "vram", "topvram", "power", "net", "ai", "tools"]
             property var haEntities: ["sensor.ac_camera_mia_temperature", "sensor.co2_monitor_co2"]
             // entita' mostrate senza grafico, solo come riga di stato
@@ -537,6 +551,10 @@ Singleton {
             property var windows: []
             // posizioni delle finestre, come "chiave:x:y" (vedi MemoryWindow)
             property var places: []
+            // parametri propri dei pannelli, come { id: { nome: valore } }:
+            // i default ci finiscono da soli alla prima partenza (vedi
+            // declarePanelParams) e si cambiano a mano in questo file
+            property var panelParams: ({})
             property bool netHideLoopback: false
             property bool netHideLan: false
         }

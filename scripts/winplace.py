@@ -8,10 +8,20 @@ Calls" — la stessa che Stenografa usa per sapere quale applicazione e' in prim
 piano.
 
     winplace.py get <titolo>
-    winplace.py set <titolo> <x> <y>
+    winplace.py set <titolo> <x> <y> [<larghezza> <altezza>]
 
 Senza l'estensione non succede nulla e il comando lo dice: la finestra si
 aprira' dove decide il window manager, che e' il comportamento di prima.
+
+Con larghezza e altezza `set` rimette anche la misura, e non e' un di piu':
+Qt non lascia scrivere `width`/`height` di una finestra e legge le implicite
+una volta sola, quando la finestra viene mappata. Se in quel momento il
+compositor la stringe — perche' la sta aprendo su uno schermo piu' piccolo di
+quello dove andra' a finire — da QML non c'e' piu' modo di rimediare. Il
+compositor invece puo': e' lo stesso che l'ha stretta. Le misure di `get` e di
+`set` sono quelle del **bordo**, decorazione compresa, non dell'area cliente
+che conosce Qt: la differenza fra le due si misura confrontandole, e cambia
+col tema.
 
 Stampa sempre un oggetto JSON su stdout.
 """
@@ -94,11 +104,19 @@ def main():
         wid, error = find(args[1])
         if error:
             result = {"ok": False, "error": error}
+        elif len(args) >= 6:
+            # Con la misura si sposta e si ridimensiona in un colpo solo: due
+            # chiamate separate farebbero saltare la finestra due volte.
+            _, error = call("MoveResize", wid, int(args[2]), int(args[3]),
+                            int(args[4]), int(args[5]))
+            result = {"ok": error is None, "error": error or "", "resized": True}
         else:
             _, error = call("Move", wid, int(args[2]), int(args[3]))
-            result = {"ok": error is None, "error": error or ""}
+            result = {"ok": error is None, "error": error or "", "resized": False}
     else:
-        result = {"ok": False, "error": "uso: winplace.py get <titolo> | set <titolo> <x> <y>"}
+        result = {"ok": False,
+                  "error": "uso: winplace.py get <titolo> | "
+                           "set <titolo> <x> <y> [<larghezza> <altezza>]"}
 
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")

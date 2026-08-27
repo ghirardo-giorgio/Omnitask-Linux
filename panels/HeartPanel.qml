@@ -1,6 +1,11 @@
 import QtQuick
 import QtQuick.Layouts
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // Il battito del braccialetto, e i numeri della giornata sotto.
 //
 // L'etichetta con l'eta' del dato non e' un ornamento: fra il polso e questo
@@ -10,10 +15,29 @@ import QtQuick.Layouts
 ColumnLayout {
     id: panel
 
-    spacing: 8
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "heart"
+    property string panelTitle: "Battito"
 
-    Component.onCompleted: Fitbit.watch()
+    // I valori che prima erano scritti nel codice e adesso stanno nel file
+    // di configurazione (sezione "panelParams" di dashboard.json): qui
+    // resta solo il default, che il pannello registra al primo avvio.
+    readonly property var defs: ({ minSpanBpm: 20 })
+    // Ampiezza minima del grafico: sotto, ingrandirebbe il rumore di un
+    // polso fermo fino a farlo sembrare una corsa.
+    readonly property int minSpanBpm: Settings.panelParam("heart", "minSpanBpm", defs.minSpanBpm)
+
+    Component.onCompleted: {
+        Fitbit.watch();
+        Settings.declarePanelParams("heart", defs);
+    }
+
     Component.onDestruction: Fitbit.unwatch()
+
+    spacing: 8
 
     readonly property int minutesOld: Fitbit.lagSeconds < 0 ? -1 : Math.round(Fitbit.lagSeconds / 60)
 
@@ -164,7 +188,7 @@ ColumnLayout {
         decimals: 0
         // Venti battiti di ampiezza minima: sotto, il grafico ingrandirebbe il
         // rumore di un polso fermo fino a farlo sembrare una corsa.
-        minSpan: 20
+        minSpan: panel.minSpanBpm
         lineColor: Settings.colorFor("heart", "#f85149")
         series: [
             {
@@ -199,6 +223,96 @@ ColumnLayout {
             if (!Fitbit.span)
                 return I18n.t("nessun dato dal braccialetto in questa finestra");
             return "";
+        }
+    }
+
+    // Quando l'errore e' «manca la chiave», la chiave si da' qui.
+    //
+    // E' lo stesso principio della riga dei telefoni qui sotto: un pannello che
+    // dice cosa manca e non lascia darlo manda a cercare un terminale per un
+    // comando solo, e chi ha il telefono in mano con il QR aperto ce l'ha
+    // davanti adesso, non fra dieci minuti.
+    //
+    // La chiave non si nasconde mentre la si scrive: sta gia' in chiaro sullo
+    // schermo del telefono da cui la si sta copiando, e mascherarla toglierebbe
+    // solo la possibilita' di accorgersi di un carattere sbagliato.
+    ColumnLayout {
+        Layout.fillWidth: true
+        spacing: 4
+        visible: Fitbit.needsToken
+
+        RowLayout {
+            Layout.fillWidth: true
+            spacing: 6
+
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: 26
+                radius: 5
+                color: "#0d1117"
+                border.width: 1
+                border.color: key.activeFocus ? "#58a6ff" : "#30363d"
+
+                TextInput {
+                    id: key
+
+                    anchors.fill: parent
+                    anchors.leftMargin: 8
+                    anchors.rightMargin: 8
+                    verticalAlignment: TextInput.AlignVCenter
+                    color: "#c9d1d9"
+                    font.pixelSize: 12
+                    font.family: "monospace"
+                    enabled: !Fitbit.pairing
+                    // Nove caratteri di un alfabeto senza le lettere che si
+                    // confondono con le cifre: e' cosi' che l'app la genera, e
+                    // filtrare qui evita di mandare allo script una chiave che
+                    // non puo' essere giusta.
+                    maximumLength: 9
+                    validator: RegularExpressionValidator {
+                        regularExpression: /[a-hj-km-np-z2-9]*/
+                    }
+                    // Quella registrata, quando ce n'e' una: qui si arriva
+                    // anche perche' il telefono l'ha rifiutata, e in quel caso
+                    // un campo vuoto nasconde proprio cio' che serve
+                    // confrontare con la chiave nuova.
+                    text: Fitbit.token
+                    onAccepted: Fitbit.pair(key.text)
+
+                    // Il binding si spezza al primo carattere scritto, che e'
+                    // giusto; ma allora una chiave cambiata dalle opzioni
+                    // mentre questo campo e' aperto non comparirebbe qui.
+                    Connections {
+                        target: Fitbit
+
+                        function onTokenChanged() {
+                            key.text = Fitbit.token;
+                        }
+                    }
+
+                    Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: key.text === ""
+                        color: "#484f58"
+                        font.pixelSize: 11
+                        text: I18n.t("la chiave scritta nell'app, poi Invio")
+                    }
+                }
+            }
+
+            Choice {
+                label: Fitbit.pairing ? I18n.t("collego…") : I18n.t("Collega")
+                onChosen: Fitbit.pair(key.text)
+            }
+        }
+
+        Text {
+            Layout.fillWidth: true
+            color: "#8b949e"
+            font.pixelSize: 10
+            wrapMode: Text.WordWrap
+            visible: text !== ""
+            text: Fitbit.pairError
         }
     }
 

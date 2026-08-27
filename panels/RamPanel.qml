@@ -1,9 +1,32 @@
 import QtQuick
 import QtQuick.Layouts
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // Memoria di sistema: andamento invece della sola barra, cosi' si vede se sta
 // salendo o se e' ferma li' da un pezzo.
 ColumnLayout {
+    id: root
+
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "ram"
+    property string panelTitle: "RAM"
+
+    // I valori che prima erano scritti nel codice e adesso stanno nel file
+    // di configurazione (sezione "panelParams" di dashboard.json): qui
+    // resta solo il default, che il pannello registra al primo avvio.
+    readonly property var defs: ({ warnPct: 90 })
+    // Soglia di riempimento oltre cui la percentuale diventa rossa.
+    readonly property real warnPct: Settings.panelParam("ram", "warnPct", defs.warnPct)
+
+    Component.onCompleted: Settings.declarePanelParams("ram", defs)
+
     spacing: 8
 
     RowLayout {
@@ -25,7 +48,7 @@ ColumnLayout {
         }
 
         Text {
-            color: SystemStats.mem.pct > 90 ? "#f85149" : "#58a6ff"
+            color: SystemStats.mem.pct > root.warnPct ? "#f85149" : "#58a6ff"
             font.pixelSize: 12
             font.bold: true
             text: `${SystemStats.mem.pct.toFixed(0)}%`

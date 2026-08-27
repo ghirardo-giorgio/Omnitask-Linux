@@ -1,6 +1,11 @@
 import QtQuick
 import QtQuick.Layouts
 
+// Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
+// ma SystemStats, Settings, I18n e i componenti della dashboard resterebbero
+// indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
+import ".."
+
 // Le cose che si rompono in silenzio.
 //
 // Nessuna di queste voci ha un grafico, perche' nessuna e' una quantita' che
@@ -10,6 +15,28 @@ import QtQuick.Layouts
 // cui si sta guardando qualcos'altro.
 ColumnLayout {
     id: root
+
+    // L'id ferma il pannello nella configurazione salvata (le colonne
+    // di dashboard.json lo citano) e lo distingue nel catalogo; il titolo
+    // e' quello che la finestra Opzioni mostra. Dichiarati qui, il
+    // catalogo e' tutto scoperto da panels/ e Settings non tiene elenchi.
+    property string panelId: "health"
+    property string panelTitle: "Stato sistema"
+
+    // I valori che prima erano scritti nel codice e adesso stanno nel file
+    // di configurazione (sezione "panelParams" di dashboard.json): qui
+    // resta solo il default, che il pannello registra al primo avvio.
+    readonly property var defs: ({
+            droppedWarnCount: 100,
+            confirmSeconds: 4
+        })
+    // Quanti pacchetti scartati valgono un'avviso: qualche scarto lo fa
+    // qualunque scheda, una valanga no.
+    readonly property int droppedWarnCount: Settings.panelParam("health", "droppedWarnCount", defs.droppedWarnCount)
+    // Secondi prima che la conferma dell'aggiornamento si ritiri da sola.
+    readonly property int confirmSeconds: Settings.panelParam("health", "confirmSeconds", defs.confirmSeconds)
+
+    Component.onCompleted: Settings.declarePanelParams("health", defs)
 
     readonly property var health: SystemStats.health
     // finche' il giro lento non ha finito il primo passaggio meta' dei campi
@@ -65,7 +92,7 @@ ColumnLayout {
                 // qualche pacchetto scartato lo fa qualunque scheda: e' il
                 // conteggio degli errori veri, o una valanga di scarti, a
                 // voler dire che c'e' un cavo o un driver che non va
-                level: errors > 0 || dropped > 100 ? "warn" : "ok"
+                level: errors > 0 || dropped > root.droppedWarnCount ? "warn" : "ok"
             }
         ];
     }
@@ -196,7 +223,7 @@ ColumnLayout {
         Timer {
             id: confirmTimeout
 
-            interval: 4000
+            interval: root.confirmSeconds * 1000
             onTriggered: updates.confirming = ""
         }
 

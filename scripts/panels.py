@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Elenca i pannelli aggiunti dall'utente in panels/.
+"""Elenca i pannelli in panels/: sono tutti li', di casa e aggiunti dall'utente.
 
 QML non sa elencare una cartella — non c'e' modo, dentro il linguaggio, di
 chiedere "cosa c'e' qui dentro" — quindi lo fa un processo, come per i servizi
-e per l'hardware.
+e per l'hardware. Dall'elenco esce il catalogo per intero: la dashboard lo usa
+per costruirsi e la finestra opzioni per farlo modificare, e non esiste piu'
+nessun secondo elenco di pannelli scritto altrove.
 
 Il posto e' obbligato, non una preferenza: Quickshell registra i singleton
 (SystemStats, I18n, Settings) per cartella di configurazione, e un .qml che sta
@@ -32,6 +34,12 @@ PARENT_IMPORT = re.compile(r'^\s*import\s+[\'"]\.\.[\'"]', re.M)
 # diventa "Mio Pannello". Chi vuole un titolo suo lo scrive nel file.
 DECLARED_TITLE = re.compile(r'property\s+string\s+panelTitle\s*:\s*[\'"](.+?)[\'"]')
 
+# L'id con cui il pannello finisce nella configurazione (le colonne di
+# dashboard.json lo citano). Chi non lo dichiara riceve "user:" piu' il nome
+# del file, che e' unico per costruzione; chi lo dichiara sceglie il suo, e
+# deve scegliere un id che nessun altro file ha gia' preso.
+DECLARED_ID = re.compile(r'property\s+string\s+panelId\s*:\s*[\'"]([A-Za-z0-9_:.-]+)[\'"]')
+
 
 def readable(name):
     """MioPannello -> "Mio Pannello", meteo_locale -> "Meteo locale"."""
@@ -57,6 +65,12 @@ def collect():
     except OSError as exc:
         return {"ok": False, "error": f"cartella dei pannelli illeggibile: {exc}",
                 "panels": [], "directory": PANELS}
+
+    # Gli id gia' visti, per rifiutare i doppioni: due file con lo stesso id si
+    # farebbero gare per la stessa riga della configurazione, e chi arriva
+    # secondo non deve entrare nel catalogo in silenzio. Vince il primo in
+    # ordine di nome, che e' lo stesso ordine con cui la lista si mostra.
+    taken = {}
 
     for name in names:
         if not name.endswith(".qml"):
@@ -87,17 +101,24 @@ def collect():
                         "title": readable(stem), "error": f"illeggibile: {exc}"})
             continue
 
-        declared = DECLARED_TITLE.search(text)
+        declared_title = DECLARED_TITLE.search(text)
+        declared_id = DECLARED_ID.search(text)
 
         entry = {
             # Prefisso perche' un pannello dell'utente non possa mai scavalcare
-            # uno di casa che si chiami allo stesso modo: gli id finiscono
-            # nella configurazione, e una collisione la sposterebbe in silenzio.
-            "id": "user:" + stem,
+            # uno che dichiara lo stesso id: gli id finiscono nella
+            # configurazione, e una collisione la sposterebbe in silenzio.
+            "id": declared_id.group(1) if declared_id else "user:" + stem,
             "file": "panels/" + stem,
-            "title": declared.group(1) if declared else readable(stem),
+            "title": declared_title.group(1) if declared_title else readable(stem),
             "bytes": os.path.getsize(path),
         }
+
+        other = taken.get(entry["id"])
+        if other:
+            entry["error"] = f'id duplicato "{entry["id"]}": gia\' usato da {other}'
+        else:
+            taken[entry["id"]] = name
 
         if not PARENT_IMPORT.search(text):
             entry["warning"] = (
