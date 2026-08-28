@@ -209,6 +209,9 @@ ColumnLayout {
     // errore da nascondere.
     function abortHermes() {
         root.hermesAborting = true;
+        // Anche la voce: se si tronca la domanda non si vuole sentire la
+        // risposta di quella prima finire di essere letta.
+        Tts.stop();
         askProc.running = false;
         watchProc.running = false;
         cancelProc.command = ["python3", root.scriptPath, "cancel"];
@@ -329,6 +332,11 @@ ColumnLayout {
             font.pixelSize: 10
             font.letterSpacing: 1
             text: root.mode === "hermes" ? "HERMES" : I18n.t("COMANDO IA")
+        }
+
+        // La voce sta qui e non fra i due microfoni perche' non e' un modo di
+        // parlare: e' cosa succede alla risposta quando arriva.
+        TtsButton {
         }
     }
 
@@ -451,6 +459,18 @@ ColumnLayout {
         color: root.phase === "error" ? "#f85149" : "#8b949e"
         font.pixelSize: 10
         text: root.message
+    }
+
+    // La voce ha una riga sua: quando non parte, il motivo e' suo (motore da
+    // installare, audio occupato) e non c'entra con quello che sta facendo il
+    // microfono.
+    Text {
+        Layout.fillWidth: true
+        visible: Tts.phase === "error" && Tts.message.length > 0
+        wrapMode: Text.Wrap
+        color: "#f85149"
+        font.pixelSize: 10
+        text: I18n.t("voce: %1").arg(Tts.message)
     }
 
     // --- la conversazione sta in una finestra a parte ---------------------
@@ -781,6 +801,9 @@ ColumnLayout {
                 // perche' una risposta che resta nascosta in un'altra vista
                 // sarebbe come non averla avuta.
                 DashActions.openHermes();
+                // E, se la voce e' accesa, si sente invece di leggerla: e'
+                // `say`, non `speakNow`, perche' l'interruttore lo guarda Tts.
+                Tts.say(data.reply ?? "");
                 root.phase = "idle";
                 root.message = "";
             }

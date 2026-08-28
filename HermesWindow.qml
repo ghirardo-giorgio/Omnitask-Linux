@@ -62,6 +62,11 @@ MemoryWindow {
                 Layout.fillWidth: true
             }
 
+            // Lo stesso interruttore del pannello: e' il singleton Tts a
+            // tenere lo stato, quindi i due si muovono insieme.
+            TtsButton {
+            }
+
             Text {
                 color: resetArea.containsMouse ? "#388bfd" : "#6e7681"
                 font.pixelSize: 10

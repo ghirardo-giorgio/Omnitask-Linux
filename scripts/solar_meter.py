@@ -161,6 +161,14 @@ MAX_WATT = 12.0
 # migliaia e cadono tutte dentro il sospetto.
 COUNTER_DROP_TOLERANCE = 1000
 
+# Quanto puo' calare l'energia in Wh senza che il tester si sia riavviato. E'
+# l'altro contatore che solo un riavvio azzera, e a differenza del cronometro
+# si legge quasi sempre: se gli mAh crollano di migliaia mentre i Wh restano
+# dove erano, il tester non si e' spento e a essere caduto e' solo l'OCR. Un
+# Wh di margine copre il brusio sui decimali; un riavvio vero ne fa cadere
+# tutte le centinaia accumulate.
+ENERGY_DROP_TOLERANCE = 1.0
+
 # Da che altezza del sole in su vale la pena guardare il tester. Zero significa
 # esattamente dall'alba al tramonto: sopra l'orizzonte si misura, sotto no.
 #
@@ -237,7 +245,8 @@ def publish(reading, sky, dry_run=False, dark=False, tempo=None):
         started = None
 
         if name == "carica":
-            value, started = daily_charge(value, persist=not dry_run, tempo=tempo)
+            value, started = daily_charge(value, persist=not dry_run, tempo=tempo,
+                                          energia=reading.get("energia"))
 
         attributes = {
             "friendly_name": "Solare " + name,
@@ -343,7 +352,7 @@ def save_day(data):
             pass
 
 
-def daily_charge(raw, persist=True, tempo=None):
+def daily_charge(raw, persist=True, tempo=None, energia=None):
     """I mAh raccolti da stamattina: il contatore di adesso meno quello di allora.
 
     Torna (oggi, inizio). La prima lettura del giorno fissa l'inizio, e da li'
@@ -390,6 +399,11 @@ def daily_charge(raw, persist=True, tempo=None):
     if isinstance(tempo, int):
         day["tempo"] = tempo
 
+    # Stessa regola per l'energia, che e' l'altro testimone di un riavvio vero
+    # (vedi counter_suspect): un Wh non letto non cancella quello ricordato.
+    if isinstance(energia, (int, float)):
+        day["energia"] = float(energia)
+
     if persist:
         save_day(day)
 
@@ -425,7 +439,7 @@ def tempo_seconds(text):
     return hours * 3600 + minutes * 60 + seconds
 
 
-def counter_suspect(raw, quality):
+def counter_suspect(raw, quality, energia=None):
     """Il contatore e' sceso ma il tester dice di non essersi mai spento.
 
     La lettura del 25 agosto alle 14:30 ha letto 5163 al posto di 65163 — le
@@ -435,6 +449,14 @@ def counter_suspect(raw, quality):
     girare: era la prova che il tester non si era riavviato, e nessuno la
     guardava. Da qui l'arbitro: contatore in calo con cronometro avanzato vuol
     dire OCR troncatore, non tester riazzerrato, e la lettura va buttata.
+
+    Il cronometro pero' non sempre si legge, e il 28 agosto alle 17:00 non si
+    e' letto: 80318 e' arrivato come 318, l'arbitro si e' astenuto per mancanza
+    di testimone e la giornata — cinquemila mAh — e' ripartita da zero. Il
+    secondo testimone e' l'energia in Wh, che sta sulla stessa riga del display
+    ma si legge quasi sempre e solo un riavvio azzera: se i Wh sono ancora
+    quelli di dieci minuti fa mentre gli mAh sono crollati, il tester non si e'
+    spento. Basta che uno dei due testimoni parli perche' la lettura cada.
     """
     day = load_day()
     previous = day.get("ultimo")
@@ -448,7 +470,18 @@ def counter_suspect(raw, quality):
     now = tempo_seconds(quality.get("tempo_tester"))
     before = day.get("tempo")
 
-    return now is not None and isinstance(before, int) and now > before
+    if now is not None and isinstance(before, int) and now > before:
+        return True
+
+    # Il cronometro non ha parlato: o non si e' letto, o e' tornato indietro
+    # anche lui (l'OCR tronca le ore come tronca gli mAh, e nello stesso
+    # scatto delle 17:20 ha fatto "0048" di un "0049"). Tocca ai Wh.
+    held = day.get("energia")
+
+    if isinstance(held, (int, float)) and isinstance(energia, (int, float)):
+        return energia >= held - ENERGY_DROP_TOLERANCE
+
+    return False
 
 
 def midnight_roll(sky=None, dry_run=False):
@@ -515,6 +548,11 @@ def midnight_roll(sky=None, dry_run=False):
 
     if isinstance(tempo, int):
         rolled["tempo"] = tempo
+
+    energia = day.get("energia")
+
+    if isinstance(energia, (int, float)):
+        rolled["energia"] = float(energia)
 
     save_day(rolled)
 
@@ -1064,11 +1102,14 @@ def run(device, roi, dry_run=False, force=False, from_text="",
     # agosto aveva corretto da solo al tentativo dopo. Se tronca anche lui si
     # butta il campione: la giornata resta dov'e', e il buco di dieci minuti
     # nel grafico costa meno della giornata rispazzata via.
-    if counter_suspect((reading or {}).get("carica"), quality):
+    if counter_suspect((reading or {}).get("carica"), quality,
+                       (reading or {}).get("energia")):
         reading, quality = measure(device, roi, dry_run, transport=transport)
 
-        if counter_suspect((reading or {}).get("carica"), quality):
-            reason = "contatore mAh in calo col cronometro del tester che invece avanzava"
+        if counter_suspect((reading or {}).get("carica"), quality,
+                           (reading or {}).get("energia")):
+            reason = ("contatore mAh in calo mentre il tester diceva di non "
+                      "essersi riavviato (cronometro avanzato o Wh fermi dov'erano)")
             count_discard(reason, dry_run)
             return {"ok": False, "scartata": True, "motivo": {"errore": reason}}
 

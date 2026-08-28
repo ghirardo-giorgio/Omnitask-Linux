@@ -74,6 +74,15 @@ ColumnLayout {
     property string sink: ""
     property string problem: ""
 
+    // Quanti player stanno suonando e quanti sono fermi: lo dice
+    // scripts/audiopause.py, che e' anche quello che li ferma. Serve ai due
+    // tasti sopra il riquadro per sapere se hanno qualcosa da fare — un
+    // pulsante premibile sempre, che a volte non fa niente, e' peggio di uno
+    // spento.
+    property int mediaPlaying: 0
+    property int mediaPaused: 0
+    property string mediaProblem: ""
+
     // Il pannello e' in una colonna visibile *e* la finestra che lo ospita e'
     // aperta: la dashboard si nasconde senza distruggere niente (shell.qml fa
     // `win.visible = false`), quindi il solo `visible` del pannello resterebbe
@@ -91,6 +100,86 @@ ColumnLayout {
     }
 
     spacing: 8
+
+    // I due tasti dell'intestazione: stessa cornice, cambia solo il disegno
+    // dentro. Restano spenti — grigi e non premibili — quando non c'e' niente
+    // da fermare o da far ripartire, che e' il caso piu' comune di tutti: un
+    // PC in silenzio.
+    component MediaKey: Rectangle {
+        id: key
+
+        // "pause" oppure "play"
+        required property string kind
+        required property bool active
+        required property string hint
+
+        signal activated
+
+        readonly property color tint: !key.active ? "#484f58" : keyHover.hovered ? "#c9d1d9" : "#8b949e"
+
+        implicitWidth: 20
+        implicitHeight: 16
+        radius: 4
+        color: keyHover.hovered && key.active ? "#161b22" : "transparent"
+        border.width: 1
+        border.color: keyHover.hovered && key.active ? "#388bfd" : "#30363d"
+
+        Canvas {
+            id: mark
+
+            anchors.centerIn: parent
+            width: 8
+            height: 8
+
+            // Il colore cambia con il passaggio del puntatore e con lo stato
+            // dei player: il Canvas non se ne accorge da solo.
+            Connections {
+                target: key
+
+                function onTintChanged(): void {
+                    mark.requestPaint();
+                }
+            }
+
+            onPaint: {
+                const ctx = mark.getContext("2d");
+
+                ctx.reset();
+                ctx.fillStyle = key.tint;
+
+                if (key.kind === "pause") {
+                    // due barre
+                    ctx.fillRect(0.5, 0, 2, 8);
+                    ctx.fillRect(5.5, 0, 2, 8);
+                    return;
+                }
+
+                // il triangolo
+                ctx.beginPath();
+                ctx.moveTo(1, 0);
+                ctx.lineTo(8, 4);
+                ctx.lineTo(1, 8);
+                ctx.closePath();
+                ctx.fill();
+            }
+        }
+
+        HoverHandler {
+            id: keyHover
+
+            cursorShape: key.active ? Qt.PointingHandCursor : Qt.ArrowCursor
+        }
+
+        TapHandler {
+            enabled: key.active
+            onTapped: key.activated()
+        }
+
+        Tooltip {
+            hovered: keyHover.hovered
+            text: key.hint
+        }
+    }
 
     Text {
         color: "#8b949e"
@@ -115,6 +204,22 @@ ColumnLayout {
             color: "#6e7681"
             font.pixelSize: 10
             text: root.problem.length > 0 ? root.problem : root.sinkLabel
+        }
+
+        // Il tasto pausa sta qui e non altrove perche' qui si vede se sta
+        // suonando qualcosa: si ferma quello che si guarda scorrere.
+        MediaKey {
+            kind: "pause"
+            active: root.mediaPlaying > 0
+            hint: root.mediaProblem.length > 0 ? root.mediaProblem : root.mediaPlaying > 0 ? I18n.t("mette in pausa tutto quello che sta suonando") : I18n.t("non sta suonando niente")
+            onActivated: root.player("pause")
+        }
+
+        MediaKey {
+            kind: "play"
+            active: root.mediaPaused > 0
+            hint: root.mediaProblem.length > 0 ? root.mediaProblem : root.mediaPaused > 0 ? I18n.t("fa ripartire quello che è stato messo in pausa") : I18n.t("niente da far ripartire")
+            onActivated: root.player("resume")
         }
     }
 
@@ -376,6 +481,72 @@ ColumnLayout {
                 root.waveRight = d.r ?? [];
                 root.wave = d.l ?? d.w ?? [];
             }
+        }
+    }
+
+    // --- pausa e ripresa ----------------------------------------------------
+
+    // I due tasti parlano con i player (MPRIS), non con il mixer: mutare il
+    // canale toglierebbe il suono lasciando scorrere la traccia, e un podcast
+    // ripreso dopo cinque minuti ripartirebbe cinque minuti piu' avanti. Il
+    // perche' per esteso — e il limite: chi non espone MPRIS non si ferma —
+    // sta in cima a scripts/audiopause.py.
+    readonly property string mediaScript: PluginPaths.of("scripts/audiopause.py")
+
+    function player(action: string): void {
+        // Un comando per volta: due clic ravvicinati su pausa e play si
+        // scavalcherebbero, e l'ultimo a rispondere non e' l'ultimo premuto.
+        if (mediaCmd.running)
+            return;
+
+        mediaCmd.command = ["python3", root.mediaScript, action];
+        mediaCmd.running = true;
+    }
+
+    function readMedia(line: string): void {
+        let d;
+
+        try {
+            d = JSON.parse(line);
+        } catch (e) {
+            return;
+        }
+
+        if (d.error) {
+            root.mediaProblem = d.error;
+            root.mediaPlaying = 0;
+            root.mediaPaused = 0;
+            return;
+        }
+
+        root.mediaProblem = "";
+        root.mediaPlaying = d.playing ?? 0;
+        root.mediaPaused = d.paused ?? 0;
+    }
+
+    // Lo stato dei player, mentre il pannello si vede — come la cattura, e per
+    // lo stesso motivo. Due secondi bastano: serve a dire se i tasti si possono
+    // premere, e chi preme ha gia' la risposta del comando (vedi `mediaCmd`)
+    // senza aspettare il giro dopo.
+    Process {
+        id: mediaWatch
+
+        running: root.listening
+
+        command: ["python3", root.mediaScript, "watch", "--interval", "2"]
+
+        stdout: SplitParser {
+            onRead: line => root.readMedia(line)
+        }
+    }
+
+    // Il comando premuto. Stampa lo stato risultante: e' quello che accende o
+    // spegne i due tasti subito, invece che al prossimo giro del watch.
+    Process {
+        id: mediaCmd
+
+        stdout: SplitParser {
+            onRead: line => root.readMedia(line)
         }
     }
 }
