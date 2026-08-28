@@ -22,7 +22,7 @@ Canvas {
     TapHandler {
         enabled: root.series.length > 0
         acceptedButtons: Qt.RightButton
-        onTapped: eventPoint => DashActions.pickColor(root.series, eventPoint.scenePosition.x, eventPoint.scenePosition.y)
+        onTapped: eventPoint => DashActions.pickColor(root.series, eventPoint.scenePosition.x, eventPoint.scenePosition.y, null)
     }
 
     readonly property real peak: {

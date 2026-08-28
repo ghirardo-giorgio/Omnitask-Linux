@@ -384,6 +384,11 @@ ColumnLayout {
         Layout.fillWidth: true
         visible: root.chart
         values: HomeAssistant.history[root.entity] ?? []
+        // Il tasto destro cancella la lettura sbagliata: e' il grafico dove
+        // serve di piu', perche' la lancetta letta male da una foto sfocata
+        // scrive un 90% che poi resta li' per sedici ore.
+        haEntity: root.entity
+        samples: HomeAssistant.historyRaw[root.entity] ?? []
         hours: HomeAssistant.historyHours
         decimals: 1
         lineColor: Settings.colorFor(`ha:${root.entity}`, root.tone)

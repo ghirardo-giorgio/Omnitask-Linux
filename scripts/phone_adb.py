@@ -2646,6 +2646,41 @@ HEALTH_DENIED = (
     "Rileggila dall'app e ridalla con `phone_adb.py health-pair LA_CHIAVE`"
 )
 
+# Il telefono c'e', la porta e' aperta, ma la lettura non finisce. Sono due
+# casi diversi che si assomigliano, e distinguerli costa un ping.
+#
+# Il primo e' il sonno: una `heart` che a telefono sveglio costa cinque secondi
+# ne ha richiesti cinquantadue con lo schermo spento da qualche ora e l'app
+# fuori dalla lista delle esentate. Health Connect e' un servizio di sistema
+# come un altro, e in Doze Android lo fa aspettare insieme a tutto il resto.
+#
+# Il secondo e' Health Connect che macina, con l'app perfettamente sveglia.
+# Misurato il 28/08/2026 sul moto g24, con l'app gia' esclusa
+# dall'ottimizzazione: sei letture di fila hanno impiegato 20,6 · 24,7 · 25,0 ·
+# 46,4 · 47,8 · 128,6 secondi, mentre `/api/ping` rispondeva in tre decimi —
+# anche *durante* una lettura, perche' il server non e' a un filo solo. Con
+# un'attesa di un minuto una lettura su tre scadeva, e usciva il consiglio di
+# premere un pulsante gia' premuto: il caso peggiore di un messaggio, quello
+# che manda a rifare una cosa fatta.
+#
+# Da cui la regola: dopo che il tempo e' scaduto si chiede un ping veloce. Se
+# risponde, il telefono e' sveglio e l'attesa e' di Health Connect; se tace, e'
+# il sonno. E' un messaggio a parte da «non c'e' nessuno» per lo stesso motivo:
+# la richiesta scadeva, si ripiegava su mDNS, mDNS taceva, e usciva la frase
+# che manda a controllare il WiFi — mentre il telefono era li' che rispondeva
+# a ogni ping.
+HEALTH_SLOW = (
+    "«%s» risponde ma la lettura non e' finita entro %d secondi. Succede quando "
+    "Android ha messo l'app a dormire: aprila sul telefono e premi «Escludi "
+    "dall'ottimizzazione» in fondo alla schermata"
+)
+
+HEALTH_GRINDING = (
+    "«%s» risponde subito, ma Health Connect non ha finito la lettura entro %d "
+    "secondi. Non e' il telefono che dorme — e' la lettura, che su questo "
+    "telefono va da venti secondi a due minuti. La misura arriva al giro dopo"
+)
+
 
 def health_read(path):
     try:
@@ -2820,7 +2855,27 @@ def health_trouble(err):
     return out
 
 
-def health_ask(action, params=None, target="", timeout=45):
+def health_stalled(host, port, name, timeout):
+    """Perche' la lettura non e' finita: il telefono dorme, o sta macinando?
+
+    Un ping costa tre decimi di secondo e risponde anche mentre la lettura e'
+    in corso (provato: il server non serializza le richieste), quindi qui la
+    domanda si puo' fare davvero invece di indovinare la risposta.
+    """
+    awake, why, code = health_get(host, port, "/api/ping", None, 8)
+
+    if awake is not None or code:
+        return HEALTH_GRINDING % (name, timeout)
+
+    # Porta chiusa: il server si e' fermato mentre leggeva, e nessuno dei due
+    # consigli qui sopra c'entra piu' — quello lo si riapre, non lo si sveglia.
+    if "refused" in (why or "").lower():
+        return HEALTH_REFUSED % name
+
+    return HEALTH_SLOW % (name, timeout)
+
+
+def health_ask(action, params=None, target="", timeout=150):
     """Una domanda al telefono e la sua risposta: (dati, errore).
 
     Ritenta una volta sola, e solo dopo aver ricontrollato l'indirizzo su mDNS:
@@ -2828,14 +2883,30 @@ def health_ask(action, params=None, target="", timeout=45):
     stantia e' la causa piu' comune di un silenzio. Oltre a quello non si
     insiste — se il secondo tentativo con l'indirizzo appena scoperto non passa,
     il motivo e' un altro e riprovare non lo cambia.
+
+    Due minuti e mezzo di attesa, non uno: la lettura di Health Connect non ha
+    un tempo, ne ha un intervallo — venti secondi nel giorno buono, oltre due
+    minuti quando il telefono ha appena travasato i dati del Fitbit (misure in
+    testa a HEALTH_GRINDING). Con un minuto scadeva una lettura su tre, e ogni
+    volta il pannello si riempiva di un errore per un dato che sarebbe arrivato
+    da solo poco dopo.
     """
     if not health_token():
         return None, HEALTH_NO_TOKEN
+
+    # Perche' il primo tentativo non e' andato. Serve al secondo giro: se mDNS
+    # non trova niente dopo che un indirizzo noto era li' a rispondere, il
+    # silenzio della rete non e' la notizia — lo e' il motivo di prima, e
+    # dirlo al posto suo manda a cercare dalla parte sbagliata.
+    stalled = ""
 
     for fresh in (False, True):
         host, port, name = health_where(target, fresh=fresh)
 
         if not host:
+            if stalled:
+                return None, stalled
+
             asleep = health_asleep()
 
             if asleep:
@@ -2868,7 +2939,17 @@ def health_ask(action, params=None, target="", timeout=45):
         if code:
             return None, why or "il telefono ha risposto %d" % code
 
-    return None, health_asleep() or (HEALTH_REFUSED % (name or host) if host else HEALTH_NOT_FOUND)
+        # Scaduto il tempo: il telefono e' li' ma sta ancora leggendo. Diverso
+        # da una porta chiusa, e vale la pena tenerlo da parte per il caso in
+        # cui il giro su mDNS non trovi piu' nessuno.
+        stalled = (
+            health_stalled(host, port, name or host, timeout)
+            if "timed out" in (why or "")
+            else HEALTH_REFUSED % (name or host)
+        )
+
+    return None, health_asleep() or stalled or (
+        HEALTH_REFUSED % (name or host) if host else HEALTH_NOT_FOUND)
 
 
 def health_remember(host, port):

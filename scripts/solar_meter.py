@@ -133,6 +133,26 @@ ROI_RECORD = os.path.join(
 POWER_TOLERANCE = 0.02
 RESISTANCE_TOLERANCE = 0.05
 
+# I limiti fisici di quello che c'e' attaccato al tester: oltre questi non c'e'
+# una misura, c'e' un errore di lettura.
+#
+# Servono perche' i vincoli qui sopra sono *relativi* e uno di loro puo' essere
+# soddisfatto per costruzione: quando si ricalcola la corrente come P/V, la
+# potenza torna esatta comunque — il residuo e' zero perche' e' lo stesso conto
+# rifatto al contrario, non perche' i numeri siano giusti. Senza resistenza sul
+# display non resta nessun secondo vincolo, e qualunque coppia (V, P) passa.
+# Successo il 28/08/2026 alle 11:20: tensione letta 0,4 V, potenza 118,236 W,
+# corrente ricostruita 295,59 A, residuo 0,0 — pubblicata, e il pannello ha
+# mostrato 118,2 W da un pannellino da dieci watt.
+#
+# I numeri: il pannello e' dichiarato sui 10 W e il piu' alto mai misurato e'
+# 8,3 W, quindi 12 W lasciano il margine di una giornata limpida senza far
+# passare due ordini di grandezza; 20 V e 5 A sono il fondo scala di una presa
+# USB con Quick Charge, cioe' il massimo che il tester stesso possa vedere.
+MAX_VOLT = 20.0
+MAX_AMP = 5.0
+MAX_WATT = 12.0
+
 # Quanto puo' calare il contatore mAh prima che la discesa venga messa in
 # discussione. Finche' c'e' corrente il contatore non cala mai: l'unica
 # discesa vera e' il riavvio del tester, che azzererebbe anche il cronometro
@@ -704,6 +724,17 @@ def reconcile(found):
     def score_of(on_power, on_resistance):
         return on_resistance if on_resistance is not None else (on_power or 0.0)
 
+    def plausible(cv, ci, cp):
+        """La terna sta dentro quello che il tester e il pannello possono fare.
+
+        E' il controllo che i residui non sanno fare: una corrente ricostruita
+        come P/V rispetta P = V·I per definizione, quindi il residuo dice zero
+        anche quando i due numeri di partenza sono sbagliati. Qui invece si
+        guarda la grandezza, che di un errore dell'OCR e' l'impronta piu'
+        vistosa — una cifra persa sposta il risultato di dieci volte.
+        """
+        return (0 <= cv <= MAX_VOLT and 0 <= ci <= MAX_AMP and 0 <= cp <= MAX_WATT)
+
     best = None
 
     # Prima ipotesi: l'OCR ha letto bene. Va verificata come le altre, ma se
@@ -712,7 +743,7 @@ def reconcile(found):
     # marcare come "corretta" una lettura che non aveva niente che non andasse.
     straight = residuals(v, i, v * i)
 
-    if acceptable(*straight):
+    if acceptable(*straight) and plausible(v, i, v * i):
         best = (score_of(*straight), "V·I", v, i, v * i)
     elif p:
         # Le altre due letture degli stessi tre numeri: si crede a due valori
@@ -723,13 +754,25 @@ def reconcile(found):
             if not acceptable(on_power, on_resistance):
                 continue
 
+            if not plausible(cv, ci, cp):
+                continue
+
             score = score_of(on_power, on_resistance)
 
             if best is None or score < best[0]:
                 best = (score, source, cv, ci, cp)
 
     if best is None:
-        return None, "nessuna combinazione rispetta P = V·I e R = V/I"
+        # Fuori scala e incoerente sono due guasti diversi: il primo e' una
+        # cifra letta male, il secondo un'inquadratura che prende meta' display.
+        if plausible(v, i, p or v * i):
+            return None, "nessuna combinazione rispetta P = V·I e R = V/I"
+
+        return None, (
+            "valori fuori scala per questo impianto (letti %.3f V, %.3f A, %s W; "
+            "il massimo credibile e' %g V, %g A, %g W): l'OCR ha letto un numero "
+            "per un altro" % (v, i, p if p else "?", MAX_VOLT, MAX_AMP, MAX_WATT)
+        )
 
     score, source, cv, ci, cp = best
 

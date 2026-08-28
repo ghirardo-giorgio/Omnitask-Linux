@@ -1,7 +1,9 @@
 import QtQuick
 import QtQuick.Layouts
 
-// Il selettore di colore dei grafici, aperto col tasto destro su una serie.
+// Il menu del tasto destro dei grafici: il colore delle serie e, per i grafici
+// che vengono da Home Assistant, la cancellazione della lettura sotto il
+// puntatore.
 //
 // Disegnato a mano come tutto il resto: QtQuick.Dialogs offrirebbe un
 // ColorDialog pronto, ma aprirebbe una finestra di sistema con l'aspetto del
@@ -14,10 +16,28 @@ Item {
     id: root
 
     // [{ id, label, fallback }] della serie o delle serie del grafico su cui si
-    // e' premuto. Vuoto = selettore chiuso.
+    // e' premuto. Vuoto = menu chiuso.
     property var series: []
     // indice della serie scelta, -1 finche' non si e' deciso
     property int chosen: -1
+
+    // La lettura sotto il puntatore — { entity, index, when, value } — o null
+    // se il grafico non viene da Home Assistant: li' non c'e' niente da
+    // cancellare, e la voce non compare.
+    property var point: null
+    // La cancellazione e' irreversibile e il gesto che la chiede e' lo stesso
+    // con cui si cambia un colore: la conferma sta fra i due, come per fermare
+    // un servizio (vedi ServiceRow).
+    property bool confirming: false
+    // Si e' confermato e si aspetta l'esito. Il menu resta aperto apposta: un
+    // intervallo senza letture o un database occupato sono risposte che
+    // l'utente deve leggere, e chiudersi subito le nasconderebbe.
+    property bool waiting: false
+
+    // Dove il menu vorrebbe stare: la posizione del puntatore, che diventa
+    // quella della scheda solo dopo essere stata riportata dentro la finestra.
+    property real wantX: 0
+    property real wantY: 0
 
     readonly property bool open: root.series.length > 0
     readonly property var current: root.chosen >= 0 && root.chosen < root.series.length ? root.series[root.chosen] : null
@@ -33,24 +53,33 @@ Item {
         "#db61a2", "#ff9bce", "#8b949e", "#c9d1d9"
     ]
 
-    function show(list: var, x: real, y: real) {
+    function show(list: var, x: real, y: real, point: var) {
         root.series = list ?? [];
         // con una serie sola non c'e' niente da scegliere: si va dritti alle
         // pastiglie
         root.chosen = root.series.length === 1 ? 0 : -1;
+        root.point = point ?? null;
+        root.confirming = false;
+        root.waiting = false;
         root.place(x, y);
     }
 
     function close() {
         root.series = [];
         root.chosen = -1;
+        root.point = null;
+        root.confirming = false;
+        root.waiting = false;
     }
 
-    // Il selettore segue il puntatore ma non esce dalla finestra: un grafico in
-    // fondo alla colonna lo aprirebbe per meta' fuori dal bordo.
+    // Il menu segue il puntatore ma non esce dalla finestra: un grafico in
+    // fondo alla colonna lo aprirebbe per meta' fuori dal bordo. Sono due
+    // legami e non due assegnazioni perche' la scheda cresce mentre e' aperta —
+    // la conferma e l'esito aggiungono una riga — e una posizione calcolata
+    // all'apertura lascerebbe uscire dal bordo proprio quella riga.
     function place(x: real, y: real) {
-        card.x = Math.max(6, Math.min(x, root.width - card.width - 6));
-        card.y = Math.max(6, Math.min(y, root.height - card.implicitHeight - 6));
+        root.wantX = x;
+        root.wantY = y;
     }
 
     anchors.fill: parent
@@ -70,6 +99,8 @@ Item {
 
         implicitWidth: 208
         implicitHeight: body.implicitHeight + 16
+        x: Math.max(6, Math.min(root.wantX, root.width - card.width - 6))
+        y: Math.max(6, Math.min(root.wantY, root.height - card.height - 6))
         radius: 8
         color: "#161b22"
         border.width: 1
@@ -262,6 +293,157 @@ Item {
                     }
                 }
             }
+
+            // --- cancellare la lettura ---------------------------------------
+            //
+            // Un sensore che una volta sola legge quello che non c'e' lascia
+            // nel grafico una montagna per tutta la finestra dello storico. Il
+            // menu nomina la lettura con la sua ora — non con quella del punto
+            // su cui si e' premuto, che puo' esserne la ripetizione — cosi' si
+            // vede quale riga si sta per togliere da Home Assistant.
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.topMargin: 2
+                visible: root.point !== null
+                implicitHeight: 1
+                color: "#21262d"
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                visible: root.point !== null && !root.confirming && !root.waiting
+                implicitHeight: 24
+                radius: 6
+                color: cutHover.hovered ? "#21262d" : "transparent"
+
+                HoverHandler {
+                    id: cutHover
+
+                    cursorShape: Qt.PointingHandCursor
+                }
+
+                TapHandler {
+                    onTapped: root.confirming = true
+                }
+
+                RowLayout {
+                    anchors.fill: parent
+                    anchors.leftMargin: 6
+                    anchors.rightMargin: 6
+                    spacing: 6
+
+                    Text {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        color: "#f85149"
+                        font.pixelSize: 11
+                        text: root.point ? I18n.t("Cancella la lettura delle %1").arg(root.point.when) : ""
+                    }
+
+                    Text {
+                        color: "#484f58"
+                        font.pixelSize: 9
+                        font.family: "monospace"
+                        text: root.point ? root.point.value : ""
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: root.confirming
+                spacing: 4
+
+                Text {
+                    Layout.fillWidth: true
+                    Layout.leftMargin: 6
+                    color: "#8b949e"
+                    font.pixelSize: 10
+                    text: I18n.t("cancellare da Home Assistant?")
+                }
+
+                Repeater {
+                    model: [
+                        {
+                            label: I18n.t("sì"),
+                            accept: true
+                        },
+                        {
+                            label: I18n.t("no"),
+                            accept: false
+                        }
+                    ]
+
+                    Rectangle {
+                        id: answer
+
+                        required property var modelData
+
+                        implicitWidth: 26
+                        implicitHeight: 20
+                        radius: 4
+                        color: answer.modelData.accept ? "#3d1418" : "#21262d"
+                        border.width: 1
+                        border.color: answer.modelData.accept ? "#f85149" : "#30363d"
+
+                        Text {
+                            anchors.centerIn: parent
+                            color: answer.modelData.accept ? "#f85149" : "#8b949e"
+                            font.pixelSize: 10
+                            text: answer.modelData.label
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: {
+                                root.confirming = false;
+
+                                if (!answer.modelData.accept)
+                                    return;
+
+                                root.waiting = true;
+                                HomeAssistant.deletePoint(root.point.entity, root.point.index);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // L'esito, per il tempo che serve a leggerlo: la riuscita chiude il
+            // menu da se' (vedi sotto), quindi qui resta solo cio' che l'utente
+            // deve sapere — un errore, o un intervallo in cui non c'era piu'
+            // niente perche' qualcuno aveva gia' cancellato.
+            Text {
+                Layout.fillWidth: true
+                Layout.leftMargin: 6
+                visible: root.waiting
+                wrapMode: Text.Wrap
+                font.pixelSize: 10
+                color: HomeAssistant.deleteError !== "" ? "#f85149" : "#8b949e"
+                text: {
+                    if (HomeAssistant.deleting)
+                        return I18n.t("cancellazione in corso…");
+                    if (HomeAssistant.deleteError !== "")
+                        return HomeAssistant.deleteError;
+                    return I18n.t("niente da cancellare qui");
+                }
+            }
+        }
+    }
+
+    // La riuscita si vede nel grafico, che si ridisegna senza quella lettura:
+    // un menu che resta aperto sopra il risultato e' un menu da chiudere a
+    // mano per vedere cio' che si e' appena chiesto.
+    Connections {
+        target: HomeAssistant
+
+        function onDeletingChanged(): void {
+            if (!root.waiting || HomeAssistant.deleting)
+                return;
+
+            if (HomeAssistant.deleteError === "" && HomeAssistant.deletedRows > 0)
+                root.close();
         }
     }
 }

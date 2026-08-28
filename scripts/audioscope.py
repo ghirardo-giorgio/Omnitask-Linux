@@ -21,6 +21,9 @@ Uscita, una riga per fotogramma:
     {"w": [-127..127], "peak": 0.42, "rms": 0.11, "sink": "...", "ms": 20}
     {"silent": true, "sink": "..."}          quando non suona niente
     {"error": "..."}                          quando manca parec o pactl
+
+Con `--stereo` i canali restano due e al posto di "w" escono "l" e "r", agganciate
+allo stesso istante: vedi `main`, dove il trigger si cerca una volta sola.
 """
 
 import argparse
@@ -102,8 +105,11 @@ class Capture:
     pipewire, che cambia con il carico.
     """
 
-    def __init__(self, keep_samples, device=None):
-        self.keep = keep_samples
+    def __init__(self, keep_samples, device=None, channels=1):
+        # `keep` e' per canale: con due canali il buffer e' lungo il doppio, ma
+        # la finestra che si disegna resta la stessa quantita' di tempo.
+        self.channels = channels
+        self.keep = keep_samples * channels
         self.forced = device
         self.lock = threading.Lock()
         self.ring = array.array("h")
@@ -161,12 +167,16 @@ class Capture:
                 self.stop.wait(RETRY_WAIT)
 
     def read_from(self, parec, device):
-        chunk = int(RATE * READ_MS / 1000) * 2
+        # Un frame sono due byte per canale, ed e' l'unita' indivisibile: un
+        # blocco tagliato a meta' di un frame scambierebbe destra e sinistra
+        # per tutto il resto della cattura.
+        frame = 2 * self.channels
+        chunk = int(RATE * READ_MS / 1000) * frame
 
         try:
             proc = subprocess.Popen(
                 [parec, "--device", device, "--format=s16le",
-                 "--rate=%d" % RATE, "--channels=1",
+                 "--rate=%d" % RATE, "--channels=%d" % self.channels,
                  "--latency-msec=%d" % int(READ_MS * 2),
                  "--client-name=Dashboard", "--stream-name=Oscilloscopio"],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
@@ -179,6 +189,12 @@ class Capture:
             self.ring = array.array("h")
 
         checked = time.monotonic()
+
+        # Quello che avanza da una lettura: si tiene e si rimette davanti alla
+        # prossima, invece di buttarlo come faceva la vecchia riga che scartava
+        # il byte dispari — in mono era mezzo campione, in stereo era
+        # l'allineamento dei canali.
+        leftover = b""
 
         try:
             while not self.stop.is_set():
@@ -193,14 +209,22 @@ class Capture:
                     if not data:
                         break
 
+                    data = leftover + data
+                    usable = len(data) - len(data) % frame
+                    leftover = data[usable:]
+
                     block = array.array("h")
-                    block.frombytes(data[:len(data) - len(data) % 2])
+                    block.frombytes(data[:usable])
 
                     with self.lock:
                         self.ring.extend(block)
 
-                        if len(self.ring) > self.keep:
-                            del self.ring[:len(self.ring) - self.keep]
+                        # Si taglia a multipli di frame, se no il primo
+                        # campione rimasto non sarebbe piu' quello sinistro.
+                        excess = len(self.ring) - self.keep
+
+                        if excess > 0:
+                            del self.ring[:excess - excess % self.channels]
 
                 now = time.monotonic()
 
@@ -218,9 +242,25 @@ class Capture:
                 proc.kill()
 
     def window(self, count):
-        """Gli ultimi `count` campioni, o meno se non ce ne sono ancora."""
+        """Gli ultimi `count` campioni per canale, o meno se non ce ne sono ancora.
+
+        Torna sempre due canali: in mono il secondo e' `None`, cosi' chi chiama
+        distingue «un canale solo» da «un canale muto». Lo slice con passo due
+        e' quello che separa l'interleaving, ed e' codice C di array: farlo a
+        mano in Python costerebbe un giro per campione, trenta volte al secondo.
+        """
         with self.lock:
-            return self.ring[-count:], self.sink, self.error
+            if self.channels == 1:
+                return self.ring[-count:], None, self.sink, self.error
+
+            tail = self.ring[-count * 2:]
+
+            # Una coda di lunghezza dispari comincerebbe dal canale destro e
+            # scambierebbe i due tracciati: si scarta il campione spaiato.
+            if len(tail) % 2:
+                del tail[0]
+
+            return tail[0::2], tail[1::2], self.sink, self.error
 
 
 # =============================================================================
@@ -256,6 +296,14 @@ def trigger(samples, window, level):
     # Nessun aggancio (un rumore senza periodo, o silenzio): si mostra la coda,
     # che e' comunque l'audio piu' recente.
     return span
+
+
+def extreme(samples):
+    """Il picco del canale, 0..1. Vuoto vuol dire zero, non un errore."""
+    if not samples:
+        return 0.0
+
+    return max(max(samples), -min(samples)) / 32768.0
 
 
 def points(samples, start, window, count):
@@ -300,6 +348,8 @@ def main():
     ap.add_argument("--points", type=int, default=96, help="colonne della forma d'onda")
     ap.add_argument("--window", type=float, default=WINDOW_MS, help="millisecondi mostrati")
     ap.add_argument("--device", help="sorgente da ascoltare invece del monitor di default")
+    ap.add_argument("--stereo", action="store_true",
+                    help="tieni separati i due canali: al posto di \"w\" escono \"l\" e \"r\"")
     args = ap.parse_args()
 
     fps = max(5.0, min(60.0, args.fps))
@@ -307,7 +357,8 @@ def main():
     window = int(RATE * max(4.0, min(200.0, args.window)) / 1000)
     look = int(window * (1 + TRIGGER_SPAN))
 
-    cap = Capture(keep_samples=look * 2, device=args.device)
+    cap = Capture(keep_samples=look * 2, device=args.device,
+                  channels=2 if args.stereo else 1)
     worker = threading.Thread(target=cap.run, daemon=True)
     worker.start()
 
@@ -333,7 +384,7 @@ def main():
             # adesso invece di rincorrere i fotogrammi persi.
             next_frame = time.monotonic()
 
-        samples, sink, error = cap.window(look)
+        left, right, sink, error = cap.window(look)
 
         if error:
             if error != said_error:
@@ -344,10 +395,12 @@ def main():
 
         said_error = None
 
-        if len(samples) < window:
+        if len(left) < window:
             continue
 
-        peak = max(max(samples), -min(samples)) / 32768.0
+        peak_left = extreme(left)
+        peak_right = extreme(right) if right is not None else 0.0
+        peak = max(peak_left, peak_right)
         now = time.monotonic()
 
         if peak >= SILENCE_PEAK:
@@ -367,22 +420,37 @@ def main():
             continue
 
         level = max(64, int(peak * 32768 * 0.15))
-        start = trigger(samples, window, level)
+
+        # Un solo aggancio per tutti e due i tracciati, cercato sul canale che
+        # suona di piu': due trigger indipendenti farebbero scivolare le due
+        # forme d'onda una rispetto all'altra, e la differenza di fra i canali
+        # — che e' l'unica cosa che si guarda tenendoli separati — sparirebbe
+        # dentro lo scorrimento. Il canale piu' forte perche' su un segnale
+        # tutto da un lato l'altro non ha zeri da agganciare.
+        reference = left if right is None or peak_left >= peak_right else right
+        start = trigger(reference, window, level)
 
         total = 0
 
-        for s in samples[start:start + window]:
-            total += s * s
+        for sample in reference[start:start + window]:
+            total += sample * sample
 
         rms = (total / max(1, window)) ** 0.5 / 32768.0
 
-        emit({
-            "w": points(samples, start, window, count),
+        frame = {
             "peak": round(peak, 4),
             "rms": round(rms, 4),
             "sink": sink,
             "ms": round(window * 1000.0 / RATE, 1),
-        })
+        }
+
+        if right is None:
+            frame["w"] = points(left, start, window, count)
+        else:
+            frame["l"] = points(left, start, window, count)
+            frame["r"] = points(right, start, window, count)
+
+        emit(frame)
 
 
 if __name__ == "__main__":

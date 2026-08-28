@@ -67,6 +67,7 @@ Singleton {
     readonly property string priorityArg: cfg.priorityRules.join(",")
     readonly property bool netHideLoopback: cfg.netHideLoopback
     readonly property bool netHideLan: cfg.netHideLan
+    readonly property var favServices: cfg.favServices
 
     function setLanguage(code: string) {
         cfg.language = code;
@@ -245,6 +246,24 @@ Singleton {
             cfg.netHideLoopback = !cfg.netHideLoopback;
         else
             cfg.netHideLan = !cfg.netHideLan;
+        configFile.writeAdapter();
+    }
+
+    // --- servizi preferiti ------------------------------------------------
+    //
+    // La chiave e' "ambito:unita'" e non la sola unita': utente e sistema sono
+    // due elenchi distinti che possono contenere lo stesso nome, e un
+    // preferito segnato fra i servizi di sessione non deve comparire in cima
+    // anche a quelli di sistema (dove magari nemmeno esiste).
+    function isFavService(scope: string, unit: string): bool {
+        return cfg.favServices.includes(`${scope}:${unit}`);
+    }
+
+    function toggleFavService(scope: string, unit: string) {
+        if (!scope.length || !unit.length)
+            return;
+        const key = `${scope}:${unit}`;
+        cfg.favServices = root.isFavService(scope, unit) ? cfg.favServices.filter(x => x !== key) : cfg.favServices.concat([key]);
         configFile.writeAdapter();
     }
 
@@ -557,6 +576,10 @@ Singleton {
             property var panelParams: ({})
             property bool netHideLoopback: false
             property bool netHideLan: false
+            // servizi tenuti in cima all'elenco, come "ambito:unita'". Una
+            // lista di stringhe come le altre di questo file: chi non ne ha
+            // mai segnato uno la trova vuota e l'elenco resta com'era.
+            property var favServices: []
         }
     }
 }

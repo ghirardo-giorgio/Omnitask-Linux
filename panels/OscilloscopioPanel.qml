@@ -40,6 +40,7 @@ ColumnLayout {
             points: 96,
             windowMs: 20,
             height: 56,
+            stereo: true,
             device: ""
         })
 
@@ -47,6 +48,13 @@ ColumnLayout {
     readonly property int points: Math.max(8, Math.min(512, Settings.panelParam("audioscope", "points", defs.points)))
     readonly property int windowMs: Math.max(4, Math.min(200, Settings.panelParam("audioscope", "windowMs", defs.windowMs)))
     readonly property int scopeHeight: Math.max(24, Settings.panelParam("audioscope", "height", defs.height))
+
+    // Due canali invece del miscuglio dei due. Il riquadro si taglia in
+    // verticale: ogni canale tiene tutta l'altezza — che e' quella che si
+    // guarda, l'ampiezza — e cede meta' larghezza, cioe' meta' dei punti per
+    // la stessa finestra di tempo. Chi vuole indietro il dettaglio orizzontale
+    // alza `points`, non `height`.
+    readonly property bool stereo: Settings.panelParam("audioscope", "stereo", defs.stereo) === true
 
     // Vuoto vuol dire «quello che si sente adesso», cioe' il monitor del sink
     // di default, che e' il caso di tutti. Chi vuole guardare sempre la stessa
@@ -58,9 +66,10 @@ ColumnLayout {
 
     // --- lo stato che si disegna --------------------------------------------
 
+    // In mono `wave` e' l'unica traccia; in stereo e' il canale sinistro e
+    // `waveRight` il destro.
     property var wave: []
-    property real peak: 0
-    property real rms: 0
+    property var waveRight: []
     property bool silent: true
     property string sink: ""
     property string problem: ""
@@ -79,16 +88,6 @@ ColumnLayout {
             return "";
         const cut = raw.replace(/\.monitor$/, "").split(".");
         return cut[cut.length - 1];
-    }
-
-    // dBFS invece della percentuale: e' la scala con cui si guarda un livello
-    // audio, e distingue il -6 dal -30 che in percentuale sono due numeri
-    // piccoli e uguali. Zero e' il massimo, sotto -60 non c'e' piu' niente.
-    readonly property string levelLabel: {
-        if (root.silent || root.peak <= 0)
-            return "−∞ dB";
-        const db = 20 * Math.log(root.peak) / Math.LN10;
-        return `${db.toFixed(0)} dB`;
     }
 
     spacing: 8
@@ -117,16 +116,6 @@ ColumnLayout {
             font.pixelSize: 10
             text: root.problem.length > 0 ? root.problem : root.sinkLabel
         }
-
-        // Il livello sta a destra come le percentuali degli altri pannelli, e
-        // si spegne di colore quando non suona niente: il numero resta al suo
-        // posto invece di sparire e far ballare la riga.
-        Text {
-            color: root.silent ? "#6e7681" : "#c9d1d9"
-            font.pixelSize: 11
-            font.family: "monospace"
-            text: root.levelLabel
-        }
     }
 
     Rectangle {
@@ -139,7 +128,9 @@ ColumnLayout {
         clip: true
 
         // La linea dello zero: senza, una forma d'onda asimmetrica sembra
-        // storta e non si capisce rispetto a cosa.
+        // storta e non si capisce rispetto a cosa. Tagliando in verticale
+        // resta una sola, perche' lo zero dei due canali sta alla stessa
+        // altezza e spezzarla in due non direbbe niente di piu'.
         Rectangle {
             anchors.left: parent.left
             anchors.right: parent.right
@@ -149,13 +140,53 @@ ColumnLayout {
             color: "#161b22"
         }
 
+        // Il taglio fra i due canali: piu' chiaro della linea dello zero,
+        // perche' quello che separa deve leggersi prima di quello che misura.
+        Rectangle {
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            x: Math.round(parent.width / 2)
+            width: 1
+            color: "#21262d"
+            visible: root.stereo
+        }
+
+        // Quale meta' e' quale. «L» e «R» non passano da I18n apposta: sono la
+        // sigla stampata sui connettori di qualunque apparecchio audio, non
+        // due parole da tradurre.
+        Text {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.margins: 3
+            color: "#30363d"
+            font.pixelSize: 9
+            text: "L"
+            visible: root.stereo
+        }
+
+        Text {
+            anchors.top: parent.top
+            anchors.topMargin: 3
+            x: Math.round(parent.width / 2) + 3
+            color: "#30363d"
+            font.pixelSize: 9
+            text: "R"
+            visible: root.stereo
+        }
+
         Canvas {
             id: scope
 
             anchors.fill: parent
             anchors.margins: 3
 
+            // Un colore per canale: "audioscope" resta l'id del sinistro —
+            // e del mono — cosi' chi aveva gia' scelto il suo verde se lo
+            // ritrova, e il destro nasce con un colore diverso perche' due
+            // tracce identiche affiancate non si distinguerebbero a colpo
+            // d'occhio.
             readonly property color traceColor: Settings.colorFor("audioscope", "#3fb950")
+            readonly property color traceRight: Settings.colorFor("audioscope-right", "#58a6ff")
 
             // Un fotogramma nuovo e' un ridisegno: il Canvas non si accorge da
             // solo che l'array e' cambiato.
@@ -168,53 +199,51 @@ ColumnLayout {
             }
 
             onTraceColorChanged: scope.requestPaint()
+            onTraceRightChanged: scope.requestPaint()
 
             // Tasto destro sul grafico: il colore della traccia, come sugli
-            // altri grafici della dashboard (vedi Sparkline).
+            // altri grafici della dashboard (vedi Sparkline). Il quarto
+            // argomento e' la lettura sotto il puntatore, che qui non esiste:
+            // l'oscilloscopio non viene da Home Assistant e non ha niente da
+            // cancellare. Ometterlo non apriva il menu affatto.
             TapHandler {
                 acceptedButtons: Qt.RightButton
-                onTapped: eventPoint => DashActions.pickColor([
+                onTapped: eventPoint => DashActions.pickColor(root.stereo ? [
+                        {
+                            id: "audioscope",
+                            label: I18n.t("Canale sinistro"),
+                            fallback: "#3fb950"
+                        },
+                        {
+                            id: "audioscope-right",
+                            label: I18n.t("Canale destro"),
+                            fallback: "#58a6ff"
+                        }
+                    ] : [
                         {
                             id: "audioscope",
                             label: I18n.t("Oscilloscopio"),
                             fallback: "#3fb950"
                         }
-                    ], eventPoint.scenePosition.x, eventPoint.scenePosition.y)
+                    ], eventPoint.scenePosition.x, eventPoint.scenePosition.y, null)
             }
 
-            onPaint: {
-                const ctx = getContext("2d");
-                ctx.reset();
-
-                const w = width;
-                const h = height;
-                const mid = h / 2;
-                const data = root.wave ?? [];
-
-                // Silenzio: la linea di mezzo, e basta. Disegnare cento punti
-                // tutti a zero darebbe lo stesso risultato costando cento volte
-                // tanto, trenta volte al secondo.
-                if (root.silent || data.length < 2) {
-                    ctx.strokeStyle = Qt.alpha(scope.traceColor, 0.35);
-                    ctx.lineWidth = 1;
-                    ctx.beginPath();
-                    ctx.moveTo(0, mid);
-                    ctx.lineTo(w, mid);
-                    ctx.stroke();
-                    return;
-                }
-
+            // Una traccia sola, dentro la striscia che va da `x0` a `x0 + w`.
+            // Sta in una funzione perche' con i canali separati la stessa cosa
+            // si fa due volte, in due strisce affiancate e di due colori.
+            function trace(ctx: var, data: var, x0: real, w: real, tint: color): void {
                 // I punti arrivano interi fra -127 e 127: mezza altezza per il
                 // pieno scala, meno un pixel perche' un picco a fondo scala non
                 // finisca tagliato contro il bordo.
+                const mid = height / 2;
                 const amp = mid - 1;
                 const step = w / (data.length - 1);
                 const yOf = v => mid - Math.max(-1, Math.min(1, v / 127)) * amp;
 
                 ctx.beginPath();
-                ctx.moveTo(0, yOf(data[0]));
+                ctx.moveTo(x0, yOf(data[0]));
                 for (let i = 1; i < data.length; i++)
-                    ctx.lineTo(i * step, yOf(data[i]));
+                    ctx.lineTo(x0 + i * step, yOf(data[i]));
 
                 // Due passate sulla stessa polilinea: una larga e trasparente,
                 // una sottile e piena. E' l'alone dei fosfori dei tubi — e
@@ -222,12 +251,60 @@ ColumnLayout {
                 // una sfocatura a fotogramma.
                 ctx.lineJoin = "round";
                 ctx.lineCap = "round";
-                ctx.strokeStyle = Qt.alpha(scope.traceColor, 0.25);
+                ctx.strokeStyle = Qt.alpha(tint, 0.25);
                 ctx.lineWidth = 3;
                 ctx.stroke();
-                ctx.strokeStyle = scope.traceColor;
+                ctx.strokeStyle = tint;
                 ctx.lineWidth = 1;
                 ctx.stroke();
+            }
+
+            function flat(ctx: var, x0: real, w: real, tint: color): void {
+                const mid = height / 2;
+                ctx.strokeStyle = Qt.alpha(tint, 0.35);
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.moveTo(x0, mid);
+                ctx.lineTo(x0 + w, mid);
+                ctx.stroke();
+            }
+
+            onPaint: {
+                const ctx = getContext("2d");
+                ctx.reset();
+
+                const left = root.wave ?? [];
+                const right = root.waveRight ?? [];
+
+                // Due strisce affiancate, con un pixel di stacco sul taglio
+                // perche' l'ultimo punto del sinistro non si appoggi al primo
+                // del destro facendoli sembrare un tratto solo.
+                const w = root.stereo ? width / 2 - 1 : width;
+                const x1 = width / 2 + 1;
+
+                // I due canali arrivano insieme o non arrivano: `right` pieno
+                // e' l'unico segno che lo script gira con --stereo, e regge
+                // anche l'istante fra il cambio di opzione e il primo
+                // fotogramma nuovo, quando il pannello e' gia' diviso ma i dati
+                // sono ancora quelli mescolati.
+                const split = root.stereo && right.length > 1;
+
+                // Silenzio: la linea di mezzo, e basta — una per striscia.
+                // Disegnare cento punti tutti a zero darebbe lo stesso
+                // risultato costando cento volte tanto, trenta volte al secondo.
+                if (root.silent || left.length < 2) {
+                    scope.flat(ctx, 0, w, scope.traceColor);
+
+                    if (root.stereo)
+                        scope.flat(ctx, x1, w, scope.traceRight);
+
+                    return;
+                }
+
+                scope.trace(ctx, left, 0, w, scope.traceColor);
+
+                if (split)
+                    scope.trace(ctx, right, x1, w, scope.traceRight);
             }
         }
     }
@@ -248,6 +325,7 @@ ColumnLayout {
             String(root.points),
             "--window",
             String(root.windowMs),
+            ...(root.stereo ? ["--stereo"] : []),
             ...(root.device.length > 0 ? ["--device", root.device] : [])
         ]
 
@@ -255,10 +333,9 @@ ColumnLayout {
         // vedeva era di prima, e non e' piu' vero.
         onRunningChanged: {
             if (!audio.running) {
+                root.waveRight = [];
                 root.wave = [];
                 root.silent = true;
-                root.peak = 0;
-                root.rms = 0;
             }
         }
 
@@ -275,6 +352,7 @@ ColumnLayout {
                 if (d.error) {
                     root.problem = d.error;
                     root.silent = true;
+                    root.waveRight = [];
                     root.wave = [];
                     return;
                 }
@@ -284,16 +362,19 @@ ColumnLayout {
 
                 if (d.silent) {
                     root.silent = true;
-                    root.peak = 0;
-                    root.rms = 0;
+                    root.waveRight = [];
                     root.wave = [];
                     return;
                 }
 
                 root.silent = false;
-                root.peak = d.peak ?? 0;
-                root.rms = d.rms ?? 0;
-                root.wave = d.w ?? [];
+
+                // Il destro prima del sinistro: il ridisegno lo innesca il
+                // cambio di `wave`, e assegnarlo per ultimo fa arrivare al
+                // Canvas due canali gia' della stessa finestra invece di
+                // ridisegnare due volte, la prima con meta' fotogramma vecchio.
+                root.waveRight = d.r ?? [];
+                root.wave = d.l ?? d.w ?? [];
             }
         }
     }

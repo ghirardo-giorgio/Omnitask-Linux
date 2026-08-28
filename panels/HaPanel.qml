@@ -71,6 +71,12 @@ ColumnLayout {
                 // si spegne per entita' dalle opzioni
                 visible: Settings.chartEnabled(entityBlock.modelData)
                 values: HomeAssistant.history[entityBlock.modelData] ?? []
+                // Da dove viene la serie, perche' il menu del tasto destro
+                // possa offrire di cancellare una lettura sbagliata: `samples`
+                // e' la stessa serie prima del riporto in avanti, e serve a
+                // sapere quale lettura sta dietro il punto (vedi HistoryChart).
+                haEntity: entityBlock.modelData
+                samples: HomeAssistant.historyRaw[entityBlock.modelData] ?? []
                 hours: HomeAssistant.historyHours
                 decimals: entityBlock.unit === "ppm" ? 0 : 1
                 lineColor: Settings.colorFor(`ha:${entityBlock.modelData}`, entityBlock.tone)

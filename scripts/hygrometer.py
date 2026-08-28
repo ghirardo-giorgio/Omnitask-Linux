@@ -118,6 +118,32 @@ def open_camera(cv2, index):
     return cap
 
 
+def fuori_scala(angle, taratura):
+    """La lancetta e' finita nella zona morta, fuori dall'arco della scala?
+
+    Il programma dell'igrometro, quando l'angolo cade li' dentro, non dice «non
+    so»: sceglie l'estremo piu' vicino e restituisce 0 o 100 (`angle_to_value`,
+    main.py). E' la scelta giusta per un mezzo grado sotto lo zero, ma vale
+    anche quando la lancetta e' stata letta male — la coda al posto della punta,
+    un riflesso, il rosso di qualcos'altro — e allora quello 0 non e' una
+    misura, e' un errore travestito. Successo il 28/08/2026 alle 09:10: angolo
+    230,67°, cioe' un grado sotto lo zero, contro i 63,62° della lettura dieci
+    minuti dopo — 167° in dieci minuti, che una lancetta non fa. E' finito nello
+    storico di Home Assistant come 0,0% e ha schiacciato la scala del grafico
+    per otto ore, mentre il pannello mostrava il 61%.
+
+    Qui si rifa' lo stesso conto di `angle_to_value` per poterlo distinguere: un
+    valore agli estremi *dentro* l'arco e' una misura vera e passa, uno che
+    viene dalla zona morta no.
+    """
+    total = (taratura["angle_0"] - taratura["angle_100"]) % 360
+
+    if total == 0:
+        return False
+
+    return (taratura["angle_0"] - angle) % 360 > total
+
+
 def raggio_stimato(directory):
     """Vero se la calibrazione e' vecchia e il raggio se lo inventa il programma.
 
@@ -237,6 +263,14 @@ def main():
 
     value = float(misura["value"])
     angle = float(misura["angle"])
+
+    # Fuori scala non e' una misura: e' l'esito previsto di una lancetta letta
+    # male o davvero oltre il fondo, e va detto invece che pubblicato (uscita
+    # 2, come «lancetta non rilevata» qui sopra).
+    if fuori_scala(angle, taratura):
+        emit({"ok": False, "quando": istante, "angolo": round(angle, 2),
+              "error": "lancetta fuori scala: lettura scartata"},
+             NIENTE)
 
     try:
         scritto = publish(value, angle, misura, stimato, args.dry_run)

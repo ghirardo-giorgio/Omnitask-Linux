@@ -10,13 +10,22 @@ Rectangle {
     property string scope: "user"
     property string query: ""
 
+    // I preferiti in cima, il resto nell'ordine che arriva da systemctl. La
+    // ricerca restringe l'elenco ma non tocca l'ordine: chi cerca "blue" e ha
+    // bluetooth fra i preferiti se lo ritrova dov'e' abituato a guardare.
     readonly property var filtered: {
         const list = Services.list(win.scope);
         const q = win.query.trim().toLowerCase();
-        if (q === "")
-            return list;
-        return list.filter(s => s.name.toLowerCase().includes(q) || (s.description ?? "").toLowerCase().includes(q));
+        const found = q === "" ? list : list.filter(s => s.name.toLowerCase().includes(q) || (s.description ?? "").toLowerCase().includes(q));
+        const fav = found.filter(s => Settings.isFavService(win.scope, s.name));
+        if (fav.length === 0)
+            return found;
+        return fav.concat(found.filter(s => !Settings.isFavService(win.scope, s.name)));
     }
+
+    // Dove finiscono i preferiti: e' l'indice della prima riga che non lo e',
+    // e la riga che ci capita sopra si porta la linea di separazione.
+    readonly property int favCount: win.filtered.filter(s => Settings.isFavService(win.scope, s.name)).length
 
     implicitWidth: 560
     implicitHeight: 660
@@ -184,10 +193,12 @@ Rectangle {
 
             delegate: ServiceRow {
                 required property var modelData
+                required property int index
 
                 width: list.width
                 service: modelData
                 scope: win.scope
+                divider: win.favCount > 0 && index === win.favCount
             }
 
             ScrollBar {

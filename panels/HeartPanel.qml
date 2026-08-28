@@ -39,7 +39,36 @@ ColumnLayout {
 
     spacing: 8
 
-    readonly property int minutesOld: Fitbit.lagSeconds < 0 ? -1 : Math.round(Fitbit.lagSeconds / 60)
+    // L'ora di adesso, che avanza da sola.
+    //
+    // Serve perche' l'eta' del dato si misura contro il presente, e il presente
+    // cambia anche quando non arriva niente di nuovo. Mezzo minuto e' il passo
+    // giusto: l'etichetta parla in minuti, e aggiornarla piu' spesso
+    // ridisegnerebbe la stessa parola.
+    property double nowSec: Date.now() / 1000
+
+    Timer {
+        interval: 30000
+        running: true
+        repeat: true
+        onTriggered: panel.nowSec = Date.now() / 1000
+    }
+
+    // Quanti minuti ha il dato che si sta guardando.
+    //
+    // Si conta dall'istante del campione e non da `lagSeconds`, che e' il
+    // ritardo misurato al momento della lettura e resta quel numero per sempre.
+    // La differenza si vede quando le letture smettono di riuscire: i punti
+    // gia' raccolti restano — giustamente, una lettura fallita non cancella
+    // un'ora di storico — e con il ritardo congelato il pannello continuava a
+    // dire «2 min fa» per un'ora, cioe' proprio la bugia che questa etichetta
+    // esiste per impedire.
+    readonly property int minutesOld: {
+        if (!Fitbit.latest || !Fitbit.latest.t)
+            return -1;
+
+        return Math.max(0, Math.round((panel.nowSec - Fitbit.latest.t) / 60));
+    }
 
     function ago(minutes) {
         if (minutes < 1)

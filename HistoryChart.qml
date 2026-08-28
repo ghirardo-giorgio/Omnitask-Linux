@@ -19,13 +19,30 @@ Item {
     // Le serie disegnate, per il selettore di colore: [{ id, label, fallback }].
     property var series: []
 
-    // Tasto destro: apre il selettore di colore. Come in Sparkline e PowerChart
-    // — sono i tre grafici del progetto, e l'handler sta in ognuno invece che
-    // nei pannelli che li usano. Senza `series` resta spento.
+    // L'entita' di Home Assistant da cui viene questa serie, per chi vuole
+    // poter cancellare una lettura sbagliata dal menu del tasto destro. Vuota =
+    // il menu offre solo il colore, ed e' il caso dei grafici che non vengono
+    // da HA: il battito arriva da Health Connect, e li' non c'e' nessuno
+    // storico da correggere — la prossima lettura lo riporterebbe uguale.
+    property string haEntity: ""
+
+    // La stessa serie di `values` prima del riporto in avanti
+    // (HomeAssistant.historyRaw): dice quali punti sono letture vere e quali la
+    // ripetizione dell'ultima nota. Senza, non si saprebbe cosa cancellare —
+    // un valore ripetuto per un'ora ha una sola riga nel recorder.
+    property var samples: []
+
+    // Tasto destro: apre il menu del grafico. Come in Sparkline e PowerChart —
+    // sono i tre grafici del progetto, e l'handler sta in ognuno invece che nei
+    // pannelli che li usano. Senza `series` resta spento.
+    //
+    // Oltre al colore, il menu offre di cancellare la lettura sotto il
+    // puntatore: quale sia lo dice `pointAt`, che va calcolato qui perche' e'
+    // qui che si sa a quale punto corrisponde quel pixel.
     TapHandler {
         enabled: root.series.length > 0
         acceptedButtons: Qt.RightButton
-        onTapped: eventPoint => DashActions.pickColor(root.series, eventPoint.scenePosition.x, eventPoint.scenePosition.y)
+        onTapped: eventPoint => DashActions.pickColor(root.series, eventPoint.scenePosition.x, eventPoint.scenePosition.y, root.pointAt(eventPoint.position.x))
     }
 
     // Estremi effettivi della serie, usati sia dal disegno che dalle etichette.
@@ -123,20 +140,66 @@ Item {
 
     readonly property bool valid: root.hasData && root.values.length > 1
 
+    // Il bucket sotto un'ascissa, senza guardare se li' c'e' un valore: e' la
+    // sola conversione da pixel a indice, e la usano sia la lettura al
+    // passaggio del mouse sia il menu del tasto destro.
+    function indexAt(x: real): int {
+        if (!root.valid || canvas.width <= 0 || x < 0 || x > canvas.width)
+            return -1;
+
+        const n = root.values.length;
+        return Math.max(0, Math.min(n - 1, Math.round(x / canvas.width * (n - 1))));
+    }
+
+    /**
+     * Da quale lettura viene il punto sotto un'ascissa, per il menu.
+     *
+     * Non e' sempre il punto stesso: Home Assistant registra uno stato solo
+     * quando cambia, e un igrometro che legge ogni dieci minuti riempie un
+     * bucket su due ripetendo il valore di prima. Cliccare su una di quelle
+     * ripetizioni vuol dire cliccare sulla lettura che la produce, quindi si
+     * risale all'ultima vera — e il menu la nomina con la sua ora, cosi' si
+     * vede quale riga si sta per cancellare invece di fidarsi.
+     *
+     * `null` quando non c'e' niente da cancellare: nessuna entita' di Home
+     * Assistant dietro il grafico, o nessuna lettura prima di quel punto.
+     */
+    function pointAt(x: real): var {
+        const index = root.indexAt(x);
+
+        if (root.haEntity === "" || index < 0 || root.samples.length !== root.values.length)
+            return null;
+
+        for (let i = index; i >= 0; i--) {
+            const v = root.samples[i];
+
+            if (v === null || v === undefined || !isFinite(v))
+                continue;
+
+            return {
+                entity: root.haEntity,
+                index: i,
+                when: root.clockAt(i),
+                value: v.toFixed(root.decimals)
+            };
+        }
+
+        return null;
+    }
+
     // L'indice sotto il puntatore, gia' spostato sul campione valido piu'
     // vicino: dentro un buco non c'e' niente da dire, ma un buco largo un
     // campione non deve far sparire la lettura mentre si scorre.
     readonly property int hoverIndex: {
-        if (!root.valid || !hover.hovered || canvas.width <= 0)
+        if (!hover.hovered)
             return -1;
 
-        const x = hover.point.position.x;
+        const centre = root.indexAt(hover.point.position.x);
 
-        if (x < 0 || x > canvas.width)
+        if (centre < 0)
             return -1;
 
         const n = root.values.length;
-        const centre = Math.max(0, Math.min(n - 1, Math.round(x / canvas.width * (n - 1))));
 
         for (let d = 0; d <= 6; d++) {
             const after = centre + d;

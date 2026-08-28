@@ -39,8 +39,8 @@ Rectangle {
     Connections {
         target: DashActions
 
-        function onPickColor(series: var, x: real, y: real): void {
-            picker.show(series, x, y);
+        function onPickColor(series: var, x: real, y: real, point: var): void {
+            picker.show(series, x, y, point);
         }
     }
 
