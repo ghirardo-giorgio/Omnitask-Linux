@@ -21,6 +21,10 @@ Singleton {
     // La chat di Hermes: il pannello Comando IA la tiene in una finestra a
     // parte per non fagocitare la colonna della dashboard.
     signal openHermes
+    // Le caratteristiche del pet: quali sensori lo fanno star bene o male. Sta
+    // in una finestra sua e non nelle Opzioni perche' e' un elenco che cresce,
+    // e la colonna e' larga 370 px.
+    signal openPetTraits
     // Quale telefono aprire: il nome di KDE Connect, che phone_adb.py sa
     // risolvere da solo in indirizzo o serial.
     signal openPhone(string device)

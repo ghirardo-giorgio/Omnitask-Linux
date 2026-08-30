@@ -23,6 +23,7 @@ Item {
     readonly property alias optionsWindow: optionsWin
     readonly property alias phoneWindow: phoneWin
     readonly property alias hermesWindow: hermesWin
+    readonly property alias petTraitsWindow: petTraitsWin
 
     // Riporta a galla una finestra, qualunque stato QML si ritrovi.
     //
@@ -78,6 +79,12 @@ Item {
         visible: false
     }
 
+    PetTraitsWindow {
+        id: petTraitsWin
+
+        visible: false
+    }
+
     // Le richieste dei pannelli arrivano dal singleton invece che per segnale:
     // caricati da un Loader, non avrebbero nessuno a cui parlare.
     Connections {
@@ -105,6 +112,10 @@ Item {
 
         function onOpenHermes(): void {
             host.show(hermesWin);
+        }
+
+        function onOpenPetTraits(): void {
+            host.show(petTraitsWin);
         }
 
         // Il telefono si assegna prima di mostrare la finestra: e' il

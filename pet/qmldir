@@ -1,0 +1,4 @@
+# Quickshell intercetta gli URL dei .qml (schema qs:@/qs/…), e sotto quello
+# schema un `import "../pet"` da panels/ non trova niente da solo: la cartella
+# va dichiarata come modulo, altrimenti PetRoom resta «is not a type».
+PetRoom 1.0 PetRoom.qml

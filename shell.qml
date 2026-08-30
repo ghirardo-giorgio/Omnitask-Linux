@@ -128,6 +128,14 @@ ShellRoot {
             host.hermesWindow.visible = !host.hermesWindow.visible;
         }
 
+        // Le caratteristiche del pet, come le altre finestre:
+        //   qs ipc call dashboard pettraits
+        // Serve anche a verificarla senza mouse — e' l'unico modo di far
+        // caricare quel QML, che altrimenti resta in un Loader mai aperto.
+        function pettraits(): void {
+            host.petTraitsWindow.visible = !host.petTraitsWindow.visible;
+        }
+
         // La finestra di un telefono, per nome — lo stesso del pannello:
         //   qs ipc call dashboard phone "moto g24"
         // Utile come scorciatoia, e come unico modo di aprirla senza mouse.
