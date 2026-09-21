@@ -15,7 +15,7 @@
     "panel": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "Dashboard",
+    "displayName": "Omnitask-Linux",
     "category": "system",
     "defaultSection": "right",
     "allowMultiple": false

@@ -22,7 +22,7 @@ ShellRoot {
     MemoryWindow {
         id: win
 
-        title: "Dashboard"
+        title: "Omnitask-Linux"
         key: "dashboard"
         defaultWidth: 740
         defaultHeight: 720
