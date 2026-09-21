@@ -19,7 +19,7 @@ import "../pet/Pet.js" as Pet
 // Il gioco e' di Ghaith Alsirawan (MIT, https://github.com/Gsirawan/Bitmochi),
 // scritto come plugin per la shell di Omarchy. Qui dentro non e' installato:
 // e' portato: pet/Pet.js e pet/Sprites.js arrivano verbatim, pet/PetRoom.qml
-// con otto modifiche elencate in pet/UPSTREAM.md, e questo file sostituisce
+// con dieci modifiche elencate in pet/UPSTREAM.md, e questo file sostituisce
 // il Panel.qml del plugin — che era la finestra flottante di Omarchy, cosa che
 // qui fa gia' la colonna della dashboard.
 //
@@ -51,9 +51,15 @@ ColumnLayout {
             terrain: "",
             terrainColor: "",
             terrainOpacity: 0.35,
+            terrainDepth: 0.25,
             background: "",
             backgroundDim: 0.35,
-            dropSeconds: 6
+            dropSeconds: 6,
+            // I suoni degli oggetti che cadono: il preavviso, il tonfo e la
+            // raccolta. Il pulsante nella riga delle cure scrive qui, e li
+            // riproduce PetSfx.qml.
+            sound: true,
+            soundVolume: 0.5
         })
     readonly property int roomHeight: Settings.panelParam("pet", "roomHeight", defs.roomHeight)
     readonly property int particleMax: Settings.panelParam("pet", "particleMax", defs.particleMax)
@@ -83,6 +89,11 @@ ColumnLayout {
     // indietro senza che nessuno colleghi le due cose.
     readonly property string terrainColorName: Settings.panelParam("pet", "terrainColor", defs.terrainColor)
     readonly property real terrainOpacity: Settings.panelParam("pet", "terrainOpacity", defs.terrainOpacity)
+
+    // Quanto il pet rimpicciolisce salendo sul grafico: la cima della curva e'
+    // il fondo della stanza, e una cosa in fondo e' piu' piccola. 0 spegne la
+    // prospettiva e lascia il pet della stessa misura dappertutto.
+    readonly property real terrainDepth: Settings.panelParam("pet", "terrainDepth", defs.terrainDepth)
 
     // La serie risolta. Gli storici ci sono gia' tutti e due: quello di Home
     // Assistant lo tiene HomeAssistant.history, quelli di sistema li campiona
@@ -127,9 +138,38 @@ ColumnLayout {
 
     onTerrainSourceChanged: panel.followHistory()
 
+    // ---- Il pallino di ADB ---------------------------------------------------
+    //
+    // `sys:adbPhones` e' l'unica sorgente che non si aggiorna da sola: le altre
+    // le campiona sysmon per tutti i pannelli, questa costa un `adb devices` e
+    // finora la chiedeva solo chi aveva il pannello Telefoni aperto. Se una
+    // caratteristica la guarda, la chiediamo noi — con lo stesso watch/unwatch
+    // dello storico di Home Assistant, per la stessa ragione: due pannelli che
+    // vogliono la stessa cosa e uno che chiude non deve spegnere l'altro.
+    readonly property bool wantsAdb: PetTraits.list.some(t => t.source === "sys:adbPhones")
+    property bool adbWatched: false
+
+    function followAdb() {
+        // Solo mentre qualcuno guarda: un oggetto caduto a dashboard chiusa
+        // sarebbe caduto per nessuno, e sei secondi dopo non ci sarebbe piu'.
+        // E' la stessa regola del timer degli oggetti.
+        const want = panel.wantsAdb && panel.watched;
+        if (want === panel.adbWatched)
+            return;
+        panel.adbWatched = want;
+        if (want)
+            PhoneAdb.watchPeek();
+        else
+            PhoneAdb.unwatchPeek();
+    }
+
+    onWantsAdbChanged: panel.followAdb()
+
     Component.onDestruction: {
         if (panel.watchedEntity.length)
             HomeAssistant.unwatchHistory(panel.watchedEntity);
+        if (panel.adbWatched)
+            PhoneAdb.unwatchPeek();
     }
 
     // ---- Dove vive il pet ---------------------------------------------------
@@ -248,6 +288,54 @@ ColumnLayout {
     property var dropHold: ({})
     property var dropCooldown: ({})
 
+    // ---- L'altra meccanica: ogni tot valori --------------------------------
+    //
+    // Per le caratteristiche a passo (`drop.every`) non si misura un'attesa ma
+    // una DISTANZA PERCORSA: quanto il valore e' salito — o sceso — da quando
+    // abbiamo cominciato a contare. Ogni `drop.step` unita' vale un oggetto,
+    // cosi' una batteria che si carica ne rende uno ogni tot mAh invece di uno
+    // solo per l'intera ricarica.
+    //
+    // 🔴 Due mappe e non una: `dropLast` e' l'ultimo valore VISTO, e serve a
+    // calcolare il passo del giro; `dropAccum` e' quello che si e' messo da
+    // parte e non e' ancora bastato. Tenerle insieme vorrebbe dire non poter
+    // distinguere «non ho ancora un riferimento» da «ho accumulato zero».
+    //
+    // Non persistono, per la stessa ragione dell'attesa qui sopra: la
+    // dashboard chiusa non e' un periodo che abbiamo guardato, e riaprirla non
+    // deve poter far cadere gli oggetti di una ricarica che nessuno ha visto.
+    property var dropAccum: ({})
+    property var dropLast: ({})
+
+    // ---- Il preavviso ------------------------------------------------------
+    //
+    // Fra la decisione di far cadere una cosa e la cosa che cade passa un
+    // istante, e in quell'istante suona il preavviso: sale per un bonus,
+    // scende per un malus. Serve a far alzare gli occhi PRIMA, perche' un
+    // oggetto va raccolto mentre e' a terra e sono sei secondi in tutto —
+    // senza, il suono arriverebbe insieme al tonfo e non avrebbe piu' niente
+    // da annunciare.
+    //
+    // 🔴 Finche' questa non e' nulla, nessun'altra caratteristica puo' far
+    // cadere niente: e' la stessa regola dell'oggetto solo in stanza, applicata
+    // al pezzo di strada in cui l'oggetto non c'e' ancora. Senza, due
+    // caratteristiche mature nello stesso giro si preavvisano insieme e la
+    // seconda cade sopra la prima.
+    property var pendingDrop: null
+
+    // Poco meno di un secondo e mezzo: il preavviso piu' lungo dura 210 ms,
+    // quindi resta un secondo buono di silenzio fra il suono e la comparsa —
+    // il tempo di guardare, che e' tutto quello che deve comprare.
+    readonly property int dropWarnMs: 1400
+
+    // ---- Il cartellino -----------------------------------------------------
+    //
+    // Che cosa e' caduto e perche', da mostrare in cima alla stanza: senza, un
+    // oggetto che compare non dice quale sensore l'ha mandato, e con cinque
+    // caratteristiche attive diventa una sorpresa invece di un riscontro.
+    // Vuoto = niente cartellino; PetRoom lo fa sparire da se'.
+    property var dropNotice: null
+
     // Gli oggetti a terra adesso. 🔴 Uno alla volta, ed e' un vincolo di
     // PetDrops e non un gusto: un Repeater su un array JavaScript ricrea tutti
     // i delegati a ogni riassegnazione, quindi il secondo oggetto farebbe
@@ -302,11 +390,17 @@ ColumnLayout {
     // se `Window.window` dovesse rispondere male su questo compositore,
     // l'uovo si sblocca lo stesso al primo passaggio del mouse invece di
     // restare inerte per sempre.
+    // ⚠️ UN SOLO handler per questo segnale, e ci sta anche il pallino di ADB:
+    // dichiararne un secondo piu' avanti nel file non li somma — Qt tiene
+    // l'ULTIMO e butta questo, in silenzio, portandosi via lo sblocco
+    // dell'uovo. Misurato: «Property value set multiple times» e' l'unica
+    // traccia che lascia.
     onWatchedChanged: {
         if (panel.watched)
             panel.markFirstOpen();
         else
             panel.clearDrops();
+        panel.followAdb();
     }
 
     // 🔴 E la cerimonia non e' un caso raro: arriva proprio quando le
@@ -399,11 +493,64 @@ ColumnLayout {
         if (panel.memorialPending || panel.pet.stage === "egg")
             return;
 
-        // Si RICOSTRUISCE invece di aggiornarlo: una caratteristica tolta dal
+        // Si RICOSTRUISCONO invece di aggiornarle: una caratteristica tolta dal
         // file sparisce da qui da sola, senza una riga che se ne ricordi.
         const hold = {};
+        const accum = {};
+        const last = {};
 
         for (const t of PetTraits.dropTraits) {
+            // Il permesso di far cadere qualcosa e' lo stesso per tutte e due
+            // le meccaniche: un oggetto alla volta nella stanza, e il riposo
+            // della caratteristica scaduto.
+            const mayDrop = panel.dropsInRoom.length === 0 && panel.pendingDrop === null && now >= (panel.dropCooldown[t.id] ?? 0);
+
+            if (t.drop.every) {
+                const seen = panel.dropLast[t.id];
+                let acc = panel.dropAccum[t.id] ?? 0;
+
+                // Un buco di lettura tiene fermo tutto, riferimento compreso:
+                // al ritorno il conto riparte dall'ultimo valore che sappiamo,
+                // non da zero.
+                if (t.value === null) {
+                    hold[t.id] = panel.dropHold[t.id] ?? 0;
+                    accum[t.id] = acc;
+                    if (seen !== undefined)
+                        last[t.id] = seen;
+                    continue;
+                }
+
+                if (seen !== undefined) {
+                    const moved = t.drop.when === "fall" ? seen - t.value : t.value - seen;
+
+                    // 🔴 Solo nel verso scelto, e non un salto qualunque. Un
+                    // balzo piu' grande di quattro passi non e' una batteria
+                    // che si carica: e' un contatore azzerato, un'entita'
+                    // cambiata sotto, o Home Assistant che torna dopo un
+                    // riavvio con un valore d'altri tempi. Contarlo vorrebbe
+                    // dire una manciata di oggetti regalati da un guasto.
+                    // Il riferimento si sposta lo stesso, qui sotto: dopo un
+                    // salto il conto riparte da dove il valore e' adesso.
+                    if (moved > 0 && moved <= t.drop.step * 4)
+                        acc += moved;
+                }
+                last[t.id] = t.value;
+
+                if (acc >= t.drop.step && mayDrop) {
+                    panel.spawnDrop(t);
+                    acc -= t.drop.step;
+                }
+
+                // ⚠️ Il resto si tiene — una carica veloce non deve perdere i
+                // 400 mAh che avanzano oltre il passo — ma non oltre un passo:
+                // con la stanza occupata o il riposo in corso l'accumulo
+                // crescerebbe per ore, e alla prima occasione libera
+                // pioverebbero dieci mele di fila.
+                accum[t.id] = Math.min(acc, t.drop.step);
+                hold[t.id] = 0;
+                continue;
+            }
+
             const prev = panel.dropHold[t.id] ?? 0;
             let ms;
 
@@ -417,7 +564,7 @@ ColumnLayout {
             else
                 ms = 0;
 
-            if (ms >= t.drop.holdMs && panel.dropsInRoom.length === 0 && now >= (panel.dropCooldown[t.id] ?? 0)) {
+            if (ms >= t.drop.holdMs && mayDrop) {
                 panel.spawnDrop(t);
                 ms = 0;
             }
@@ -426,22 +573,65 @@ ColumnLayout {
         }
 
         panel.dropHold = hold;
+        panel.dropAccum = accum;
+        panel.dropLast = last;
     }
 
+    // La decisione: suona il preavviso e mette la caratteristica in attesa. La
+    // caduta vera e' un secondo e mezzo dopo, in `releaseDrop()`.
     function spawnDrop(t) {
+        panel.pendingDrop = t;
+        PetSfx.play(t.drop.item.kind === "malus" ? "warnMalus" : "warnBonus");
+        warnTimer.restart();
+    }
+
+    function releaseDrop() {
+        const t = panel.pendingDrop;
+        panel.pendingDrop = null;
+        if (!t)
+            return;
+
+        // La caratteristica puo' essere stata tolta o cambiata di ruolo mentre
+        // il preavviso suonava: la finestra delle caratteristiche e' aperta
+        // proprio quando si prova questa roba, e far cadere l'oggetto di una
+        // regola che non c'e' piu' sarebbe la peggiore delle sorprese.
+        const live = PetTraits.dropTraits.find(x => x.id === t.id);
+        if (!live)
+            return;
+
         panel.dropSeq++;
         // 🔴 La chiave e' unica per CADUTA e non per caratteristica: due
         // cadute della stessa sono due oggetti diversi, e un segnale in
         // ritardo sulla prima non deve poter raccogliere la seconda.
         panel.dropsInRoom = [
             {
-                key: `${t.id}#${panel.dropSeq}`,
-                trait: t.id,
-                glyph: t.drop.item.glyph,
-                kind: t.drop.item.kind,
-                gift: t.drop.gift
+                key: `${live.id}#${panel.dropSeq}`,
+                trait: live.id,
+                glyph: live.drop.item.glyph,
+                kind: live.drop.item.kind,
+                gift: live.drop.gift
             }
         ];
+
+        panel.dropNotice = {
+            glyph: live.drop.item.glyph,
+            kind: live.drop.item.kind,
+            text: panel.noticeFor(live)
+        };
+    }
+
+    // Che cosa scrive il cartellino: il nome della caratteristica e il MOTIVO,
+    // non l'effetto. «Solare carica +500 mAh» dice perche' e' arrivata la
+    // batteria; «+16 energia» direbbe solo che qualcosa e' successo, e quel
+    // numero si legge gia' sulla riga in cima quando l'oggetto viene raccolto.
+    //
+    // Le due meccaniche hanno due motivi diversi: a passo il motivo e' la
+    // distanza percorsa, a soglia e' il valore che sta fuori.
+    function noticeFor(t) {
+        const unit = t.unit ? " " + t.unit : "";
+        if (t.drop.every)
+            return `${t.label} ${t.drop.when === "fall" ? "−" : "+"}${PetTraits.pretty(t.drop.step)}${unit}`;
+        return `${t.label} ${t.value === null ? I18n.t("n/d") : PetTraits.pretty(t.value) + unit}`;
     }
 
     function startCooldown(traitId) {
@@ -488,6 +678,13 @@ ColumnLayout {
             panel.startCooldown(d.trait);
         panel.dropsInRoom = [];
         panel.dropSeenAt = 0;
+        // Anche l'attesa: un preavviso suonato mentre la dashboard si chiudeva
+        // non deve far comparire un oggetto in una stanza che nessuno guarda —
+        // sei secondi dopo non ci sarebbe piu', e la caratteristica avrebbe
+        // speso il suo turno per niente.
+        warnTimer.stop();
+        panel.pendingDrop = null;
+        panel.dropNotice = null;
     }
 
     // L'effetto una tantum di un oggetto raccolto.
@@ -686,6 +883,17 @@ ColumnLayout {
     // calcola in forma chiusa e sa quello che dice, mentre un oggetto che cade
     // e' un fatto che succede a schermo. Uno caduto mentre nessuno guardava
     // sarebbe caduto per nessuno — e sei secondi dopo non ci sarebbe piu'.
+    // Il secondo e mezzo fra il preavviso e la caduta. Uno solo per il
+    // pannello, perche' una sola caratteristica alla volta puo' essere in
+    // attesa — vedi `pendingDrop`.
+    Timer {
+        id: warnTimer
+
+        interval: panel.dropWarnMs
+        repeat: false
+        onTriggered: panel.releaseDrop()
+    }
+
     Timer {
         interval: 5000
         running: panel.watched && panel.petLoaded
@@ -756,16 +964,18 @@ ColumnLayout {
         moodFactor: panel.moodFactor
         memorialPending: panel.memorialPending
 
-        // Le caratteristiche dai sensori: le barre in piu' e le nuvole. Solo
-        // quelle che le hanno chieste — una caratteristica puo' agire sulle
-        // statistiche senza occupare una riga della stanza.
-        extraStats: PetTraits.barTraits
+        // Le caratteristiche dai sensori che si vedono nella stanza: le
+        // nuvole di molecole. Le barre non ci sono piu' — la riga in cima
+        // tiene le quattro statistiche del gioco e basta — ma una
+        // caratteristica continua ad agire sulle statistiche, a far cadere
+        // oggetti e a far ammalare il pet senza occupare posto a schermo.
         particleTraits: PetTraits.particleTraits
 
         // Il pavimento e il fondale. Vuoti tutti e due, la stanza e' quella di
         // sempre: linea piatta e niente sfondo.
         terrainValues: panel.terrainValues
         terrainOpacity: panel.terrainOpacity
+        terrainDepth: panel.terrainDepth
         backgroundDim: panel.backgroundDim
         background: panel.background ? "file://" + panel.background.replace("~", Quickshell.env("HOME")) : ""
 
@@ -786,6 +996,15 @@ ColumnLayout {
 
         drops: panel.dropsInRoom
         dropSeconds: panel.dropSeconds
+
+        // Il cartellino di che cosa e' caduto, e l'interruttore dei suoni. La
+        // stanza li DISEGNA soltanto: che cosa scriverci lo decide chi possiede
+        // la meccanica (qui sopra, `noticeFor`), e l'interruttore lo scrive
+        // questo file nei panelParams — la stessa divisione di `drops` e di
+        // `extraStats` prima di loro.
+        notice: panel.dropNotice
+        soundOn: PetSfx.enabled
+        onSoundToggled: Settings.setPanelParam("pet", "sound", !PetSfx.enabled)
 
         onDropCaught: key => panel.dropCaught(key)
         onDropExpired: key => panel.endDrop(key)

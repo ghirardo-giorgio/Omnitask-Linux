@@ -18,11 +18,11 @@ Rectangle {
     // comando dei processi lunghi si taglia comunque, e le misure restano
     // sempre incolonnate sulla destra.
     readonly property int nameWidth: Math.round(win.width * 0.40)
-    // La fascia a destra occupata dalle cinque colonne numeriche, dal pulsante
-    // di chiusura e dalle spaziature fra loro: i numeri sono quelli del
-    // RowLayout di ProcRow. Serve al riquadro di dettaglio, che deve stare
-    // fuori da qui.
-    readonly property int metricsWidth: 5 * win.metricWidth + 24 + 6 * 6 + 8
+    // La fascia a destra occupata dalle sei colonne numeriche, dal pulsante
+    // di chiusura, dal margine destro e dalle spaziature fra loro: i numeri
+    // sono quelli del RowLayout di ProcRow. Serve al riquadro di dettaglio,
+    // che deve stare fuori da qui.
+    readonly property int metricsWidth: 6 * win.metricWidth + 24 + 6 * 6 + 12
 
     // azione di massa in attesa del secondo clic di conferma
     property string confirmingAction: ""
@@ -89,7 +89,9 @@ Rectangle {
         win.closeMenuLater();
     }
 
-    implicitWidth: 840
+    // Sei colonne numeriche invece di cinque: la stessa aria che aveva la
+    // colonna del processo a 840, senza strizzarla.
+    implicitWidth: 920
     implicitHeight: 620
     color: "#0d1117"
 
@@ -240,6 +242,47 @@ Rectangle {
                 color: "#6e7681"
                 font.pixelSize: 10
                 text: I18n.t("%1 di %2").arg(Processes.results.length).arg(Processes.scopeCount)
+            }
+
+            // Tutti i processi che il filtro lascia passare, in un colpo
+            // solo. Secondo clic: li deseleziona tutti, perche' dopo un
+            // seleziona-tutti per sbaglio ripassare da qui e' la via piu'
+            // corta.
+            Rectangle {
+                id: selectAllChip
+
+                Layout.alignment: Qt.AlignVCenter
+                visible: Processes.results.length > 0
+                implicitWidth: selectAllLabel.implicitWidth + 16
+                implicitHeight: 22
+                radius: 4
+                color: selectAllHover.hovered ? "#21262d" : "transparent"
+                border.width: 1
+                border.color: "#30363d"
+
+                HoverHandler {
+                    id: selectAllHover
+
+                    cursorShape: Qt.PointingHandCursor
+                }
+
+                Text {
+                    id: selectAllLabel
+
+                    anchors.centerIn: parent
+                    color: "#8b949e"
+                    font.pixelSize: 10
+                    text: Processes.allFilteredSelected ? I18n.t("deseleziona tutti") : I18n.t("seleziona tutti")
+                }
+
+                TapHandler {
+                    onTapped: {
+                        if (Processes.allFilteredSelected)
+                            Processes.clearSelected();
+                        else
+                            Processes.selectAll();
+                    }
+                }
             }
         }
 
@@ -471,6 +514,10 @@ Rectangle {
                     {
                         key: "gpu",
                         label: "GPU"
+                    },
+                    {
+                        key: "vram",
+                        label: "VRAM"
                     },
                     {
                         key: "io",

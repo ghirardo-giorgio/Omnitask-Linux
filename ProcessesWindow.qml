@@ -5,7 +5,8 @@ MemoryWindow {
 
     title: I18n.t("Processi")
     key: "processes"
-    defaultWidth: 840
+    // sei colonne numeriche: vedi ProcessesPanel per la misura
+    defaultWidth: 920
     defaultHeight: 620
     color: "#0d1117"
 

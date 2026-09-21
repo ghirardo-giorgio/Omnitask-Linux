@@ -20,6 +20,7 @@ Rectangle {
     readonly property string background: Settings.panelParam("pet", "background", "")
     readonly property string terrainColor: Settings.panelParam("pet", "terrainColor", "")
     readonly property real terrainOpacity: Settings.panelParam("pet", "terrainOpacity", 0.35)
+    readonly property real terrainDepth: Settings.panelParam("pet", "terrainDepth", 0.25)
     readonly property real backgroundDim: Settings.panelParam("pet", "backgroundDim", 0.35)
     readonly property int dropSeconds: Settings.panelParam("pet", "dropSeconds", 6)
 
@@ -165,11 +166,9 @@ Rectangle {
         // una caratteristica che c'e' gia'.
         const base = PetTraits.defaultsFor(source, isFinite(value) && value !== null ? value : 0, role);
 
-        // L'id viene dalla sorgente, ridotto a lettere e numeri: e' stabile,
-        // leggibile nel file, e non cambia se poi si rinomina l'etichetta.
-        const stem = source.replace(/^(ha:|sys:)/, "").replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 24) || "trait";
-
-        const id = PetTraits.freeId(stem);
+        // L'id viene dalla sorgente: la regola sta in PetTraits perche' la usa
+        // anche il server MCP quando aggiunge una caratteristica da fuori.
+        const id = PetTraits.freeId(PetTraits.idFor(source));
 
         PetTraits.upsert(Object.assign({
             id: id,
@@ -600,6 +599,52 @@ Rectangle {
                                     Text {
                                         color: "#6e7681"
                                         font.pixelSize: 10
+                                        text: I18n.t("prospettiva")
+                                    }
+
+                                    RowLayout {
+                                        spacing: 4
+
+                                        Repeater {
+                                            model: [0.0, 0.15, 0.25, 0.4]
+
+                                            Rectangle {
+                                                id: depthChip
+
+                                                required property var modelData
+
+                                                readonly property bool current: Math.abs(win.terrainDepth - depthChip.modelData) < 0.01
+
+                                                implicitWidth: 34
+                                                implicitHeight: 22
+                                                radius: 5
+                                                color: depthChip.current ? "#21262d" : "transparent"
+                                                border.width: 1
+                                                border.color: depthChip.current ? "#58a6ff" : "#30363d"
+
+                                                Text {
+                                                    anchors.centerIn: parent
+                                                    color: depthChip.current ? "#58a6ff" : "#8b949e"
+                                                    font.pixelSize: 10
+                                                    text: Math.round(depthChip.modelData * 100) + "%"
+                                                }
+
+                                                MouseArea {
+                                                    anchors.fill: parent
+                                                    cursorShape: Qt.PointingHandCursor
+                                                    onClicked: Settings.setPanelParam("pet", "terrainDepth", depthChip.modelData)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                ColumnLayout {
+                                    spacing: 2
+
+                                    Text {
+                                        color: "#6e7681"
+                                        font.pixelSize: 10
                                         text: I18n.t("velo sullo sfondo")
                                     }
 
@@ -697,6 +742,14 @@ Rectangle {
                                 color: "#484f58"
                                 font.pixelSize: 10
                                 text: I18n.t("Lo sfondo copre tutto il pannello e sta sotto al grafico. Qualunque misura va bene: se è più piccola viene ingrandita di un numero intero di volte a pixel netti, se è più grande viene rimpicciolita in modo morbido. Per disegnarla a pixel, 256 × 160 px.")
+                            }
+
+                            Text {
+                                Layout.fillWidth: true
+                                wrapMode: Text.WordWrap
+                                color: "#484f58"
+                                font.pixelSize: 10
+                                text: I18n.t("La prospettiva è quanto il pet rimpicciolisce salendo sul grafico: sulla cima è lontano, nella valle è vicino. A 0% resta della stessa misura ovunque.")
                             }
                         }
                     }

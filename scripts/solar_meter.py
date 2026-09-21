@@ -169,6 +169,25 @@ COUNTER_DROP_TOLERANCE = 1000
 # tutte le centinaia accumulate.
 ENERGY_DROP_TOLERANCE = 1.0
 
+# Quanto puo' SALIRE il contatore mAh oltre il tetto fisico prima che la
+# salita venga messa in discussione. Il tetto e' MAX_AMP per il tempo passato
+# fra due letture — a cinque ampere il tester non puo' contare di piu', e con
+# il timer da dieci minuti fanno 833 mAh contro i cinquanta veri — e questo e'
+# il margine per il brusio dell'OCR sull'ultima cifra. Duecento, non mille
+# come sui cali: li' la tolleranza doveva stare sotto le code di numero
+# troncato, qui sopra il rumore e basta.
+COUNTER_LEAP_TOLERANCE = 200
+
+# Sotto questa tensione media una salita degli mAh non e' carica raccolta.
+# E' il secondo testimone, per quando il tetto qui sopra e' largo — la prima
+# lettura del mattino dista undici ore dall'ultima di ieri sera, e undici ore
+# di tetto non fermano niente. I Wh e gli mAh salgono insieme sullo stesso
+# display: il loro rapporto e' la tensione con cui la carica e' entrata, e su
+# una presa USB non scende a zero. Due volt sono larghi per un tester che
+# lavora sui quattro, e un uno fantasma davanti agli mAh li sfonda di due
+# ordini di grandezza.
+MIN_IMPLIED_VOLT = 2.0
+
 # Da che altezza del sole in su vale la pena guardare il tester. Zero significa
 # esattamente dall'alba al tramonto: sopra l'orizzonte si misura, sotto no.
 #
@@ -394,6 +413,12 @@ def daily_charge(raw, persist=True, tempo=None, energia=None):
 
     day["ultimo"] = raw
 
+    # Quando si e' visto quel contatore, secondo l'orologio di casa. Serve a
+    # `counter_leap` per sapere quanto tempo il tester ha avuto per contare:
+    # il cronometro del display direbbe lo stesso e meglio, ma si legge solo
+    # quando si legge, e l'ora di casa c'e' sempre.
+    day["visto"] = time.time()
+
     # Un cronometro non letto non cancella quello ricordato: il display spento,
     # per esempio, ripubblica il contatore fermo ma non mostra nessun tempo.
     if isinstance(tempo, int):
@@ -484,6 +509,98 @@ def counter_suspect(raw, quality, energia=None):
     return False
 
 
+def counter_leap(raw, quality, energia=None):
+    """Il contatore e' salito piu' di quanto il tester potesse contare.
+
+    Il gemello di `counter_suspect`, per il segno opposto. Il 13 settembre
+    alle 12:40 il display diceva 2483 e l'OCR ha letto 12483: un uno di troppo
+    davanti, il bordo del riquadro scambiato per una cifra. La lettura e'
+    passata perche' non la guardava nessuno — i vincoli fisici riguardano V,
+    I, P e R, e l'arbitro di qui sopra guarda solo i cali — e la giornata e'
+    schizzata a 11.026 mAh su un power bank che ne tiene 10.000.
+
+    Il danno pero' non e' finito li', ed e' la ragione per cui una salita va
+    fermata come un calo: 12483 e' finito nell'appunto come ultimo contatore
+    visto, e le letture dopo — tornate ai 2500 veri — sono cadute una a una
+    proprio nell'arbitro dei cali, che le vedeva crollare di diecimila. Il
+    numero gonfiato si cementa, e da solo non scende piu'.
+
+    Il tetto non ha bisogno di indovinare niente: a MAX_AMP il tester non puo'
+    contare piu' di MAX_AMP per il tempo passato. Il tempo lo dice il
+    cronometro del display quando si legge, e l'orologio di casa quando no.
+    Fra due letture da dieci minuti sono 833 mAh, contro i cinquanta veri: i
+    diecimila di quel giorno non ci stanno dentro per un ordine di grandezza.
+    """
+    day = load_day()
+    previous = day.get("ultimo")
+
+    if not isinstance(previous, (int, float)) or not isinstance(raw, (int, float)):
+        return False
+
+    climb = raw - previous
+
+    if climb <= COUNTER_LEAP_TOLERANCE:
+        return False
+
+    # Quanto tempo ha avuto il tester per contare. Il cronometro del display
+    # e' la misura giusta perche' e' il tempo del tester, non il nostro; se
+    # non si e' letto va bene l'orologio di casa, che fra due scatti del timer
+    # dice la stessa cosa a meno di un secondo.
+    now = tempo_seconds(quality.get("tempo_tester"))
+    before = day.get("tempo")
+    seen = day.get("visto")
+
+    if now is not None and isinstance(before, int) and now > before:
+        elapsed = float(now - before)
+    elif isinstance(seen, (int, float)):
+        elapsed = max(0.0, time.time() - float(seen))
+    else:
+        elapsed = None
+
+    if elapsed is not None and climb > MAX_AMP * 1000 * elapsed / 3600 + COUNTER_LEAP_TOLERANCE:
+        return True
+
+    # Il tetto e' largo quando le due letture sono lontane: la prima del
+    # mattino dista dall'ultima di ieri sera undici ore, e undici ore di
+    # tetto non fermano nessuno. Qui parla l'altro testimone, che e' di nuovo
+    # l'energia — Wh e mAh salgono insieme sullo stesso display, e il loro
+    # rapporto e' la tensione con cui quella carica e' entrata.
+    held = day.get("energia")
+
+    if isinstance(held, (int, float)) and isinstance(energia, (int, float)):
+        gained = energia - held
+
+        # Se i Wh sono SCESI e' l'OCR ad averli troncati (succede: due volte
+        # nella sola mattina del 13 settembre), e un testimone che si
+        # contraddice non si ascolta — altrimenti butterebbe la lettura buona
+        # degli mAh per un errore che sta su un altro numero.
+        if gained >= 0:
+            return gained * 1000 < climb * MIN_IMPLIED_VOLT
+
+    return False
+
+
+def counter_doubt(reading, quality):
+    """Perche' il contatore mAh di questa lettura non si crede, o "" se si crede.
+
+    Due arbitri e un verdetto solo: il contatore non scende mentre il tester
+    dice di non essersi riavviato, e non sale piu' in fretta di quanto il
+    tester sappia contare. In mezzo alle due c'e' la lettura buona.
+    """
+    charge = (reading or {}).get("carica")
+    energia = (reading or {}).get("energia")
+
+    if counter_suspect(charge, quality, energia):
+        return ("contatore mAh in calo mentre il tester diceva di non "
+                "essersi riavviato (cronometro avanzato o Wh fermi dov'erano)")
+
+    if counter_leap(charge, quality, energia):
+        return ("contatore mAh salito piu' di quanto il tester potesse "
+                "contare nel tempo passato (una cifra di troppo davanti)")
+
+    return ""
+
+
 def midnight_roll(sky=None, dry_run=False):
     """Al primo giro dopo la mezzanotte il giorno ricomincia, senza fotografia.
 
@@ -543,8 +660,17 @@ def midnight_roll(sky=None, dry_run=False):
         # bene cosi': e' un buco, non uno zero falso.
         pass
 
+    # `visto` resta quello dell'ultima lettura vera, che e' ieri sera: qui non
+    # si e' guardato nessun display, si e' solo riaperta la giornata attorno
+    # allo stesso contatore. Scriverci adesso vorrebbe dire raccontare a
+    # `counter_leap` che il tester ha contato zero secondi da mezzanotte.
     rolled = {"giorno": today.isoformat(), "inizio": float(start),
               "ultimo": float(start)}
+
+    seen = day.get("visto")
+
+    if isinstance(seen, (int, float)):
+        rolled["visto"] = float(seen)
 
     if isinstance(tempo, int):
         rolled["tempo"] = tempo
@@ -1095,23 +1221,24 @@ def run(device, roi, dry_run=False, force=False, from_text="",
 
     reading, quality = measure(device, roi, dry_run, transport=transport)
 
-    # Prima di pubblicare, il sospetto: un contatore che scende mentre il
-    # cronometro del tester avanza non e' un azzeramento, e' una lettura
-    # troncata dall'OCR. Il secondo scatto quasi sempre legge bene — fuoco e
-    # luce cambiano da un istante all'altro, e il giro delle 14:41 del 25
-    # agosto aveva corretto da solo al tentativo dopo. Se tronca anche lui si
-    # butta il campione: la giornata resta dov'e', e il buco di dieci minuti
-    # nel grafico costa meno della giornata rispazzata via.
-    if counter_suspect((reading or {}).get("carica"), quality,
-                       (reading or {}).get("energia")):
-        reading, quality = measure(device, roi, dry_run, transport=transport)
+    # Prima di pubblicare, il dubbio sul contatore: una cifra persa lo fa
+    # crollare, una cifra di troppo lo fa schizzare, e ne' l'una ne' l'altra
+    # e' una misura (vedi `counter_doubt`). Il secondo scatto quasi sempre
+    # legge bene — fuoco e luce cambiano da un istante all'altro, e il giro
+    # delle 14:41 del 25 agosto aveva corretto da solo al tentativo dopo. Se
+    # sbaglia anche lui si butta il campione: la giornata resta dov'e', e il
+    # buco di dieci minuti nel grafico costa meno della giornata rispazzata
+    # via — o di una giornata gonfiata che poi si porta dietro tutte le
+    # letture buone del pomeriggio.
+    doubt = counter_doubt(reading, quality)
 
-        if counter_suspect((reading or {}).get("carica"), quality,
-                           (reading or {}).get("energia")):
-            reason = ("contatore mAh in calo mentre il tester diceva di non "
-                      "essersi riavviato (cronometro avanzato o Wh fermi dov'erano)")
-            count_discard(reason, dry_run)
-            return {"ok": False, "scartata": True, "motivo": {"errore": reason}}
+    if doubt:
+        reading, quality = measure(device, roi, dry_run, transport=transport)
+        doubt = counter_doubt(reading, quality)
+
+        if doubt:
+            count_discard(doubt, dry_run)
+            return {"ok": False, "scartata": True, "motivo": {"errore": doubt}}
 
     if reading is None:
         count_discard(str(quality.get("errore", "")), dry_run)

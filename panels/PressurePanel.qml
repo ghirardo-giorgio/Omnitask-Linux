@@ -71,6 +71,21 @@ ColumnLayout {
         }
     ]
 
+    // I primi tre di SystemStats.cgroups, e solo mentre la memoria e' sotto
+    // pressione: `warnPct` e' la stessa soglia oltre cui il numero della
+    // memoria si accende, quindi l'elenco compare esattamente quando la barra
+    // comincia a chiedere «per colpa di chi».
+    readonly property var culprits: {
+        const psi = SystemStats.pressure.memory?.someAvg60 ?? 0;
+        if (psi < root.warnPct)
+            return [];
+        return (SystemStats.cgroups ?? []).slice(0, 3);
+    }
+
+    function gb(bytes: real): string {
+        return (bytes / 1073741824).toFixed(1) + " GB";
+    }
+
     spacing: 6
 
     Text {
@@ -132,6 +147,80 @@ ColumnLayout {
                         fallback: row.modelData.fallback
                     }
                 ]
+            }
+        }
+    }
+
+    // ---- Chi la memoria ce l'ha ------------------------------------------
+    //
+    // 🔴 Le barre qui sopra dicono QUANTO si aspetta, mai per colpa di chi, ed
+    // e' la domanda che si fa ogni volta che diventano rosse. La pressione per
+    // cgroup — che sarebbe la risposta ovvia — non la da': misura quanto ognuno
+    // ha ATTESO, quindi in cima ci finiscono la shell grafica e l'editor, cioe'
+    // le vittime, mentre chi si e' preso la memoria per primo non aspetta
+    // niente. Questa riga mostra invece chi la OCCUPA.
+    //
+    // La colonna che conta e' `shmem`: la cache il kernel la butta via quando
+    // serve, la memoria condivisa no — si puo' solo swappare, una pagina alla
+    // volta, mentre tutti gli altri aspettano.
+    //
+    // Compare solo quando la memoria e' davvero sotto pressione: a macchina
+    // tranquilla sarebbe una classifica di cose normali, e tre righe in piu'
+    // in un pannello che si guarda di sfuggita.
+    ColumnLayout {
+        Layout.fillWidth: true
+        Layout.topMargin: 4
+        spacing: 1
+        visible: root.culprits.length > 0
+
+        Text {
+            color: "#8b949e"
+            font.pixelSize: 9
+            font.letterSpacing: 1
+            text: I18n.t("CHI OCCUPA LA MEMORIA")
+        }
+
+        Repeater {
+            model: root.culprits
+
+            RowLayout {
+                id: culprit
+
+                required property var modelData
+
+                Layout.fillWidth: true
+                spacing: 6
+
+                Text {
+                    Layout.fillWidth: true
+                    elide: Text.ElideRight
+                    color: "#c9d1d9"
+                    font.pixelSize: 10
+                    // Il comando quando c'e', il nome del cgroup quando manca:
+                    // gli scope delle app grafiche si chiamano tutti
+                    // `app-org.chromium.Chromium-<pid>.scope` — e' cosi' che si
+                    // annuncia ogni applicazione Electron — e senza il comando
+                    // un'app qualunque si legge «Chromium» e sembra il browser.
+                    text: culprit.modelData.comm && culprit.modelData.comm.length > 0
+                          ? culprit.modelData.comm
+                          : culprit.modelData.name
+                }
+
+                // Quanta di quella memoria non si puo' buttare. Rossa quando e'
+                // la maggior parte: e' la forma che ha il guaio, non la misura.
+                Text {
+                    visible: culprit.modelData.shmem > 0
+                    color: culprit.modelData.shmem > culprit.modelData.mem / 2 ? "#f85149" : "#8b949e"
+                    font.pixelSize: 10
+                    text: I18n.t("%1 condivisa").arg(root.gb(culprit.modelData.shmem))
+                }
+
+                Text {
+                    color: "#8b949e"
+                    font.pixelSize: 10
+                    font.bold: true
+                    text: root.gb(culprit.modelData.mem)
+                }
             }
         }
     }

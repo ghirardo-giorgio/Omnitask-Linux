@@ -39,6 +39,11 @@ SMART_INTERVAL = 300.0
 # Stato generale del sistema.
 HEALTH_INTERVAL = 60.0
 
+# Ogni quanto si rifa' la classifica dei cgroup che occupano memoria. Dieci
+# secondi come la classifica della RAM, e per la stessa ragione: e' una lista
+# che si legge, non una misura che si insegue.
+CGROUP_INTERVAL = 10.0
+
 # Aggiornamenti disponibili.
 UPDATE_INTERVAL = 3600.0
 
@@ -400,6 +405,375 @@ def rapl_energy(rapl):
 
     except (OSError, ValueError):
         return None
+
+
+
+# =============================================================================
+# ENERGIA / WATTORA
+# =============================================================================
+#
+# I watt dicono adesso, i wattora dicono la giornata: sono la stessa misura
+# integrata nel tempo, e l'integrale non si puo' ricostruire dopo — o lo si
+# accumula mentre passa, o e' perso. Da qui questa sezione, che tiene il conto
+# accanto al campionamento invece di chiederlo a uno storico.
+#
+# Due sorgenti, due modi diversi di contare, per una ragione fisica:
+#
+#   CPU: RAPL espone gia' un CONTATORE di energia in microjoule, quindi la
+#        somma dei delta e' esatta — non perde niente fra un campione e
+#        l'altro, nemmeno se il ciclo arriva in ritardo.
+#   GPU: nvidia-smi espone solo la potenza istantanea, quindi l'energia si
+#        ricava per rettangoli (W per dt). E' un'approssimazione, e sotto
+#        carico a scatti sbaglia in eccesso o in difetto a seconda di dove
+#        cade il campione.
+#
+# Quello che NON c'e' dentro: scheda madre, RAM, dischi, ventole, perdite
+# dell'alimentatore, monitor. Qui si accumula solo cio' che e' misurato, e la
+# stima del resto la fa il pannello con i suoi parametri — cosi' chi ritara
+# la stima non riscrive la storia gia' contata.
+
+# Lo stato dell'accumulo. E' un appunto, non una configurazione: descrive una
+# sessione di accensione e alla successiva non vale piu' niente, quindi sta
+# nella cache accanto agli altri appunti (solar-day.json, solar-roi.json) e
+# non in ~/.config/quickshell.
+ENERGY_RECORD = os.path.join(
+    os.environ.get("XDG_CACHE_HOME")
+    or os.path.expanduser("~/.cache"),
+    "quickshell",
+    "energy.json",
+)
+
+# Ogni quanto l'accumulo finisce su disco. Non a ogni campione: il conto vive
+# in memoria e il file serve solo a non ripartire da zero quando la dashboard
+# viene riaperta, quindi mezzo minuto di lavoro perso e' il prezzo giusto per
+# non scrivere un file al secondo per tutto il giorno.
+ENERGY_SAVE_INTERVAL = 30.0
+
+# Oltre questo scarto fra due campioni l'intervallo non si conta.
+#
+# Serve contro la sospensione, che e' il caso in cui questo conto sbaglierebbe
+# di piu' e in silenzio: al risveglio `dt` vale le ore passate a dormire, il
+# contatore RAPL nel frattempo ha girato un numero ignoto di volte (il campo
+# max_energy_range_uj qui vale 65 kJ, cioe' meno di mezz'ora a pieno carico) e
+# la GPU si vedrebbe attribuire ore di potenza a rettangolo. Quell'intervallo
+# non e' misurabile: si salta, e i suoi secondi non entrano nella copertura —
+# che e' il motivo per cui la copertura viene pubblicata insieme al totale.
+ENERGY_MAX_GAP = 10.0
+
+# Quante fasce orarie si tengono. Due giorni bastano per una macchina accesa
+# la mattina e spenta la sera, e mettono un tetto a un file che altrimenti
+# crescerebbe per tutta la vita di un'accensione lunga.
+ENERGY_HOURS = 48
+
+
+def boot_id():
+    """Identificativo di questa accensione.
+
+    E' la chiave che decide se l'accumulo salvato e' ancora il nostro: il
+    kernel ne genera uno nuovo a ogni avvio, quindi un file scritto ieri viene
+    riconosciuto come vecchio e buttato senza dover confrontare orologi — che
+    l'ora di sistema puo' saltare, l'uptime azzerarsi, e il fuso cambiare.
+    """
+
+    data = read_file(
+        "/proc/sys/kernel/random/boot_id"
+    )
+
+    return data.strip() if data else ""
+
+
+def hour_key(now):
+    """Inizio dell'ora locale che contiene `now`, in secondi epoch.
+
+    Locale e non UTC perche' la fascia serve a dire "verso le tre del
+    pomeriggio", e chi guarda il pannello legge l'orologio di casa.
+    """
+
+    parts = time.localtime(now)
+
+    return int(
+        time.mktime(
+            (
+                parts.tm_year,
+                parts.tm_mon,
+                parts.tm_mday,
+                parts.tm_hour,
+                0,
+                0,
+                0,
+                0,
+                -1,
+            )
+        )
+    )
+
+
+def energy_fresh(bid, boot_at, now):
+    """Un accumulo che parte da zero."""
+
+    return {
+        "bootId": bid,
+        "bootAt": boot_at,
+        "startedAt": now,
+        "cpuJ": 0.0,
+        "gpuJ": 0.0,
+        "seconds": 0.0,
+        "hours": {},
+    }
+
+
+def energy_load(bid, boot_at, now):
+    """Riprende l'accumulo di questa accensione, o ne comincia uno.
+
+    Il file di ieri non e' un errore: e' il caso normale del primo avvio dopo
+    un riavvio, e si sostituisce in silenzio.
+    """
+
+    try:
+        with open(
+            ENERGY_RECORD,
+            encoding="utf-8",
+        ) as f:
+            saved = json.load(f)
+
+    except (
+        OSError,
+        ValueError,
+    ):
+        return energy_fresh(
+            bid,
+            boot_at,
+            now,
+        )
+
+    if (
+        not isinstance(saved, dict)
+        or not bid
+        or saved.get("bootId") != bid
+    ):
+        return energy_fresh(
+            bid,
+            boot_at,
+            now,
+        )
+
+    fresh = energy_fresh(
+        bid,
+        boot_at,
+        now,
+    )
+
+    # Si riprendono i campi uno per uno con il tipo giusto invece di fidarsi
+    # del file: e' scritto da noi, ma vive nella cache, dove qualunque cosa
+    # puo' averlo troncato a meta' scrittura.
+    for key in (
+        "cpuJ",
+        "gpuJ",
+        "seconds",
+    ):
+        try:
+            fresh[key] = max(
+                0.0,
+                float(saved.get(key, 0.0)),
+            )
+
+        except (TypeError, ValueError):
+            pass
+
+    try:
+        fresh["startedAt"] = float(
+            saved["startedAt"]
+        )
+
+    except (
+        KeyError,
+        TypeError,
+        ValueError,
+    ):
+        pass
+
+    hours = saved.get("hours")
+
+    if isinstance(hours, dict):
+        for key, value in hours.items():
+            try:
+                fresh["hours"][str(int(key))] = {
+                    "j": max(
+                        0.0,
+                        float(value["j"]),
+                    ),
+                    "s": max(
+                        0.0,
+                        float(value["s"]),
+                    ),
+                }
+
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+    return fresh
+
+
+def energy_track(
+    state,
+    cpu_joules,
+    gpu_watts,
+    dt,
+    now,
+):
+    """Aggiunge all'accumulo l'energia dell'intervallo appena passato.
+
+    `cpu_joules` e' None quando RAPL non ha dato un delta utilizzabile, e
+    `gpu_watts` quando la GPU non e' leggibile: in entrambi i casi si somma
+    zero da quella parte invece di saltare l'intervallo intero, perche' un
+    solo contatore mancante non rende cieco anche l'altro.
+    """
+
+    if (
+        dt <= 0
+        or dt > ENERGY_MAX_GAP
+    ):
+        return
+
+    joules = (cpu_joules or 0.0) + (
+        (gpu_watts or 0.0) * dt
+    )
+
+    state["cpuJ"] += cpu_joules or 0.0
+    state["gpuJ"] += (
+        gpu_watts or 0.0
+    ) * dt
+    state["seconds"] += dt
+
+    key = str(hour_key(now))
+
+    bucket = state["hours"].get(key)
+
+    if bucket is None:
+        bucket = {"j": 0.0, "s": 0.0}
+        state["hours"][key] = bucket
+
+    bucket["j"] += joules
+    bucket["s"] += dt
+
+    if (
+        len(state["hours"])
+        > ENERGY_HOURS
+    ):
+        for old in sorted(
+            state["hours"],
+            key=int,
+        )[
+            : len(state["hours"])
+            - ENERGY_HOURS
+        ]:
+            del state["hours"][old]
+
+
+def energy_save(state):
+    """Scrive l'accumulo. Nessuno lo guarda, quindi si puo' scrivere atomico.
+
+    La regola di casa che vieta la scrittura atomica vale per i file sotto un
+    FileView — cambiare inode staccherebbe il guardiano. Questo esce da
+    stdout, non da un file guardato, quindi qui tmp+rename e' solo il modo di
+    non lasciare mezzo JSON dopo uno spegnimento brusco.
+    """
+
+    tmp = ENERGY_RECORD + ".tmp"
+
+    try:
+        os.makedirs(
+            os.path.dirname(
+                ENERGY_RECORD
+            ),
+            exist_ok=True,
+        )
+
+        with open(
+            tmp,
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(state, f)
+
+        os.replace(
+            tmp,
+            ENERGY_RECORD,
+        )
+
+    except OSError:
+        try:
+            os.unlink(tmp)
+
+        except OSError:
+            pass
+
+
+def energy_payload(state, now):
+    """La forma che va nel JSON per la dashboard.
+
+    I joule diventano wattora qui e non nel QML perche' il pannello non deve
+    sapere in che unita' e' tenuto il conto; `seconds` esce accanto ai totali
+    perche' senza di lui il numero non e' verificabile — dice quanta parte
+    dell'accensione e' davvero stata misurata, e quindi quanto vale la stima
+    che il pannello ci costruisce sopra.
+    """
+
+    hours = []
+
+    for key in sorted(
+        state["hours"],
+        key=int,
+    ):
+        bucket = state["hours"][key]
+
+        hours.append(
+            {
+                "h": int(key),
+                "wh": round(
+                    bucket["j"] / 3600.0,
+                    2,
+                ),
+                "s": round(
+                    bucket["s"],
+                    1,
+                ),
+            }
+        )
+
+    return {
+        "cpuWh": round(
+            state["cpuJ"] / 3600.0,
+            2,
+        ),
+        "gpuWh": round(
+            state["gpuJ"] / 3600.0,
+            2,
+        ),
+        "seconds": round(
+            state["seconds"],
+            1,
+        ),
+        # Quando la macchina si e' accesa e da quando la si sta misurando:
+        # due istanti diversi ogni volta che la dashboard viene aperta a
+        # sessione gia' avviata, ed e' l'unico modo che ha il pannello per
+        # dire "da mezzogiorno" invece di far credere di aver visto la
+        # mattina.
+        "bootAt": round(state["bootAt"]),
+        "startedAt": round(
+            state["startedAt"]
+        ),
+        "now": round(now),
+        # Le fasce orarie escono come lista ordinata e non come oggetto: il
+        # QML le disegna in fila da sinistra a destra, e l'ordine di un
+        # oggetto JavaScript con chiavi numeriche non e' una cosa su cui si
+        # appoggia un grafico.
+        "hours": hours,
+    }
 
 
 # =============================================================================
@@ -815,6 +1189,198 @@ def ram_worker():
             pass
 
         time.sleep(RAM_INTERVAL)
+
+
+# =============================================================================
+# CHI OCCUPA LA MEMORIA
+# =============================================================================
+#
+# La pressione di /proc/pressure dice QUANTO si e' aspettato, mai per colpa di
+# chi. E la pressione per cgroup non lo dice nemmeno lei: misura quanto quel
+# cgroup ha ATTESO, quindi in cima ci finiscono le vittime — la shell grafica,
+# l'editor — mentre chi si e' preso la memoria per primo non aspetta niente e
+# risulta innocente.
+#
+# Quello che manca, e che questa sonda aggiunge, e' l'altra meta': chi la
+# memoria ce l'ha. Con una distinzione che e' l'unica cosa che conta davvero
+# quando il sistema si pianta:
+#
+#   file    -> page cache, il kernel la butta via quando serve: gratis
+#   shmem   -> memoria condivisa, NON si butta: si puo' solo swappare
+#   anon    -> memoria del processo, si swappa
+#
+# Un cgroup da 38 GB di cui 21 di shmem non e' un cgroup che "usa la cache":
+# e' 21 GB che il kernel deve spostare su swap una pagina alla volta mentre
+# tutti gli altri aspettano. Misurato su questa macchina il 2026-09-02: 18
+# "page allocation stall" da 10-14 secondi in tre minuti.
+
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+# Sotto questa soglia un cgroup non e' interessante per nessuna domanda che
+# valga la pena fare: e' rumore in una lista che serve a trovare il colpevole.
+CGROUP_MIN_BYTES = 512 * 1024 * 1024
+
+
+def _cgroup_name(path):
+    """Il nome dell'unita', e il comando che ci gira dentro.
+
+    🔴 Il comando NON e' un di piu': gli scope delle app grafiche si chiamano
+    tutti `app-org.chromium.Chromium-<pid>.scope` perche' e' cosi' che si
+    annuncia ogni applicazione Electron. Senza il comando, il colpevole di
+    questa macchina si leggeva "Chromium" e sembrava il browser: era Pinokio,
+    con dentro un job di Stable Diffusion.
+    """
+    name = os.path.basename(path) or "/"
+    comm = ""
+
+    try:
+        with open(os.path.join(path, "cgroup.procs")) as handle:
+            first = handle.readline().strip()
+        if first:
+            with open(f"/proc/{first}/comm") as handle:
+                comm = handle.readline().strip()
+            # Il nome del processo e' troncato a 15 caratteri in `comm`;
+            # cmdline ha quello vero, ed e' li' che si legge "pinokio-bin".
+            try:
+                with open(f"/proc/{first}/cmdline", "rb") as handle:
+                    argv0 = handle.read().split(b"\0")[0].decode(errors="replace")
+                if argv0:
+                    comm = os.path.basename(argv0) or comm
+            except OSError:
+                pass
+    except (OSError, ValueError):
+        pass
+
+    return name, comm
+
+
+def _cgroup_number(path, filename):
+    try:
+        with open(os.path.join(path, filename)) as handle:
+            return int(handle.readline().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _cgroup_stat(path):
+    """anon / file / shmem di un cgroup, in byte."""
+    out = {"anon": 0, "file": 0, "shmem": 0}
+
+    try:
+        with open(os.path.join(path, "memory.stat")) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                if key in out:
+                    try:
+                        out[key] = int(value)
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+
+    # `file` include shmem in cgroup v2, e sommarli sarebbe contarlo due volte.
+    # Qui `file` resta la sola cache buttabile, che e' la distinzione utile.
+    out["file"] = max(0, out["file"] - out["shmem"])
+    return out
+
+
+def _cgroup_pressure(path):
+    """Quanto QUESTO cgroup ha aspettato la memoria, in percentuale su 60 s."""
+    try:
+        with open(os.path.join(path, "memory.pressure")) as handle:
+            for line in handle:
+                if line.startswith("full"):
+                    for pair in line.split()[1:]:
+                        key, _, value = pair.partition("=")
+                        if key == "avg60":
+                            return float(value)
+    except (OSError, ValueError):
+        pass
+    return 0.0
+
+
+def compute_cgroups(limit):
+    """I cgroup che occupano piu' memoria, con la parte non buttabile."""
+    found = []
+
+    for current, dirs, files in os.walk(CGROUP_ROOT):
+        # Oltre questa profondita' ci sono solo i figli dei container, che
+        # rispondono gia' nel loro padre.
+        if current.count(os.sep) - CGROUP_ROOT.count(os.sep) > 5:
+            dirs[:] = []
+            continue
+        if "memory.current" not in files:
+            continue
+
+        total = _cgroup_number(current, "memory.current")
+        if total < CGROUP_MIN_BYTES:
+            continue
+
+        found.append((total, current))
+
+    found.sort(reverse=True)
+
+    # 🔴 Si tiene il cgroup PIU' SPECIFICO, non il piu' grosso, e la differenza
+    # e' tutta la sonda: ogni padre contiene i figli, quindi la classifica
+    # grezza e' sempre "user.slice, user@1000.service, app.slice" — tre righe
+    # per la stessa memoria e nessun colpevole. Un cgroup viene scartato quando
+    # un suo discendente ne spiega gia' la maggior parte.
+    #
+    # La soglia e' 60% e non 100% perche' un padre ha quasi sempre anche
+    # qualcosa di suo: `user@1000.service` tiene i suoi servizi accanto ad
+    # app.slice, e chiedere che il figlio spieghi TUTTO non scarterebbe mai
+    # nessuno.
+    explained = []
+
+    for total, path in found:
+        prefix = path + os.sep
+        if any(other >= total * 0.6 for other, child in found
+               if child.startswith(prefix)):
+            continue
+        explained.append((total, path))
+
+    out = []
+
+    for total, path in explained:
+        stat = _cgroup_stat(path)
+        name, comm = _cgroup_name(path)
+
+        out.append({
+            "path": path[len(CGROUP_ROOT):] or "/",
+            "name": name,
+            "comm": comm,
+            "mem": total,
+            "anon": stat["anon"],
+            # Cache buttabile: se un cgroup e' grosso ma e' tutto qui dentro,
+            # non e' un problema.
+            "cache": stat["file"],
+            "shmem": stat["shmem"],
+            "swap": _cgroup_number(path, "memory.swap.current"),
+            "high": _cgroup_number(path, "memory.high"),
+            "waited": _cgroup_pressure(path),
+        })
+
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+_cgroups = []
+
+
+def cgroup_worker():
+    """Aggiorna periodicamente chi occupa la memoria."""
+
+    global _cgroups
+
+    while True:
+        try:
+            _cgroups = compute_cgroups(5)
+        except Exception:
+            pass
+
+        time.sleep(CGROUP_INTERVAL)
 
 
 # =============================================================================
@@ -3077,6 +3643,19 @@ def main():
     rapl = find_rapl()
     prev_energy = rapl_energy(rapl)
 
+    # L'accumulo dei wattora riparte da dove l'aveva lasciato la dashboard
+    # precedente, se e' la stessa accensione. `bootAt` si calcola una volta
+    # sola: e' un'ora di orologio ricavata dall'uptime, e ricavarla a ogni giro
+    # la farebbe ballare di un secondo avanti e indietro sotto agli occhi.
+    _boot_id = boot_id()
+    _now = time.time()
+    energy_state = energy_load(
+        _boot_id,
+        _now - uptime(),
+        _now,
+    )
+    energy_saved_at = time.monotonic()
+
     _sensors = scan_sensors()
 
     scan_cpufreq()
@@ -3111,6 +3690,11 @@ def main():
 
     threading.Thread(
         target=health_worker,
+        daemon=True,
+    ).start()
+
+    threading.Thread(
+        target=cgroup_worker,
         daemon=True,
     ).start()
 
@@ -3187,6 +3771,11 @@ def main():
 
         cpu_watts = None
 
+        # I joule dell'intervallo, tenuti a parte dai watt: i watt sono
+        # arrotondati a un decimale per essere letti, e sommare per ore un
+        # numero arrotondato vorrebbe dire accumulare anche l'errore.
+        cpu_joules = None
+
         energy = rapl_energy(rapl)
 
         if (
@@ -3206,10 +3795,12 @@ def main():
                 delta += rapl["max"]
 
             if delta >= 0:
+                cpu_joules = (
+                    delta / 1e6
+                )
+
                 cpu_watts = round(
-                    delta
-                    / 1e6
-                    / dt,
+                    cpu_joules / dt,
                     1,
                 )
 
@@ -3246,6 +3837,27 @@ def main():
                 1,
             ),
         }
+
+        # ---------------------------------------------------------------------
+        # ENERGIA
+        # ---------------------------------------------------------------------
+
+        sampled_at = time.time()
+
+        energy_track(
+            energy_state,
+            cpu_joules,
+            gpu_watts,
+            dt,
+            sampled_at,
+        )
+
+        if (
+            now - energy_saved_at
+            >= ENERGY_SAVE_INTERVAL
+        ):
+            energy_save(energy_state)
+            energy_saved_at = now
 
         gpu_list = gpu_procs()
 
@@ -3449,6 +4061,10 @@ def main():
 
             "pressure": psi,
 
+            # Chi la memoria ce l'ha, accanto a quanto si e' aspettata: le due
+            # meta' della stessa domanda.
+            "cgroups": _cgroups,
+
             "health": health,
 
             "gpu": gpu(smi),
@@ -3468,6 +4084,11 @@ def main():
             "topRam": _top_ram,
 
             "power": power,
+
+            "energy": energy_payload(
+                energy_state,
+                sampled_at,
+            ),
 
             "disks": disk_list,
         }

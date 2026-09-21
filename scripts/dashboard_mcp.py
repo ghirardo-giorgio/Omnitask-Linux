@@ -23,7 +23,8 @@ Two sources, each chosen because it is the authoritative one for its data:
     when the dashboard is not up, which is the one case where "what is in this
     machine?" is most likely to be asked.
 
-Everything is read-only except one tool, which acts on Home Assistant.
+Everything is read-only except three tools: one acts on Home Assistant, and two
+write the pixel pet's traits — the sensors that make objects fall into its room.
 """
 import json
 import os
@@ -63,12 +64,31 @@ class DashboardUnavailable(Exception):
     """
 
 
+# How to address the running dashboard.
+#
+# 🔴 `--any-display`, and it is not decoration: `qs ipc` only considers an
+# instance live when it shares the CALLER's display connection, so without
+# WAYLAND_DISPLAY in the environment it reports "no running instances" while the
+# dashboard is right there on screen. An MCP server is started by whatever the
+# user is chatting in — LM Studio from a desktop launcher, Hermes from a systemd
+# unit — and neither is guaranteed to pass that variable through. Measured: with
+# WAYLAND_DISPLAY stripped, every tool failed with "the dashboard is not
+# answering. Start it with `qs -c dashboard`" against a dashboard that was
+# running and visible, which is the worst kind of wrong answer — it sends the
+# user to fix something that is not broken.
+#
+# The flags also go AFTER `ipc`: `qs -c name ipc call` works, `qs -i id ipc call`
+# does not, and keeping both in one place is what stops that from being
+# rediscovered.
+IPC_FLAGS = ["-c", CONFIG, "--any-display"]
+
+
 def ipc(function, request):
     """Call one of the dashboard's IPC functions with a JSON string argument."""
     try:
         done = subprocess.run(
-            ["qs", "-c", CONFIG, "ipc", "call", "dashboard", function,
-             json.dumps(request)],
+            ["qs", "ipc"] + IPC_FLAGS + ["call", "dashboard", function,
+                                         json.dumps(request)],
             capture_output=True,
             text=True,
             timeout=15,
@@ -885,6 +905,92 @@ TOOLS = [
             "required": ["entity_id", "action"],
         },
     },
+    {
+        "name": "pressure",
+        "description": (
+            "Why the machine is stalling and whose fault it is. Answers 'why "
+            "did everything freeze for a minute?', 'what is eating the "
+            "memory?', 'is it swapping?'. Reports two things that are easy to "
+            "confuse and must not be: how long everything WAITED (CPU, disk, "
+            "memory pressure), and who HOLDS the memory. They are usually "
+            "different cgroups — whoever took the memory first waits for "
+            "nothing, so per-cgroup pressure puts the victims on top. In "
+            "`holders`, compare `shmem_bytes` against `memory_bytes`: page "
+            "cache is dropped for free, shared memory can only be swapped, and "
+            "a holder that is mostly shmem is the one that stalls everything. "
+            "Read `name`, not the unit: every Electron app registers as "
+            "'app-org.chromium.Chromium-<pid>.scope' and is not the browser."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "pet_traits",
+        "description": (
+            "What the pixel pet's traits are wired to: every trait with its "
+            "sensor, its current reading and how it makes objects fall, plus "
+            "the catalogue of objects (apple, battery, chilli, bomb…) and every "
+            "measure a trait can watch — the dashboard's own samples and the "
+            "numeric Home Assistant entities. Read this before pet_trait_set: "
+            "the item ids and the source strings it returns are the ones that "
+            "call expects."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "pet_trait_set",
+        "description": (
+            "Create or amend one of the pet's traits — this writes to the "
+            "dashboard's configuration. A trait either feeds the pet's four "
+            "stats continuously (role 'wellness') or drops an object into its "
+            "room (role 'drop', the default). A dropping trait fires in one of "
+            "two ways: on a threshold the value must hold ('above'/'below' with "
+            "`threshold` and `hold_minutes`), or every so many units the value "
+            "travels ('rise'/'fall' with `step`) — the second is the one for "
+            "counters, e.g. an apple every 500 mAh of solar charge. Naming an "
+            "existing `id` amends that trait; naming only a `source` creates a "
+            "new one, already complete with sensible defaults."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "source": {"type": "string", "description": "'ha:<entity_id>' or 'sys:<key>', from pet_traits.sources. Required for a new trait."},
+                "id": {"type": "string", "description": "Amend this existing trait instead of creating one."},
+                "label": {"type": "string", "description": "What the panel calls it, e.g. 'Solare carica'."},
+                "role": {"type": "string", "enum": ["drop", "wellness"], "description": "'drop' makes objects fall (default); 'wellness' feeds the four stats continuously."},
+                "when": {
+                    "type": "string",
+                    "enum": ["above", "below", "rise", "fall"],
+                    "description": "How it fires. 'above'/'below' watch where the value sits; 'rise'/'fall' count how far it travels.",
+                },
+                "step": {"type": "number", "description": "Units per object, for 'rise'/'fall'. E.g. 500 with a mAh sensor."},
+                "threshold": {"type": "number", "description": "The line, for 'above'/'below'."},
+                "hold_minutes": {"type": "number", "description": "How long the threshold must hold before the object falls."},
+                "cooldown_minutes": {"type": "number", "description": "How long the trait rests after one object, in both modes."},
+                "item": {"type": "string", "description": "Catalogue id from pet_traits.items (e.g. 'battery', 'apple', 'chili'), or an emoji to add a new object."},
+                "item_label": {"type": "string", "description": "Name for a new emoji object."},
+                "kind": {"type": "string", "enum": ["bonus", "malus"], "description": "Whether a NEW emoji object is a reward or a punishment."},
+                "gift": {
+                    "type": "object",
+                    "description": "What collecting it does, in points: {\"energy\": 10}. Only the stats you name change; negative numbers punish.",
+                    "properties": {
+                        "hunger": {"type": "number"},
+                        "energy": {"type": "number"},
+                        "happiness": {"type": "number"},
+                        "hygiene": {"type": "number"},
+                    },
+                },
+            },
+        },
+    },
+    {
+        "name": "pet_trait_remove",
+        "description": "Delete one of the pet's traits by id. This writes to the dashboard's configuration.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"id": {"type": "string", "description": "Trait id, from pet_traits."}},
+            "required": ["id"],
+        },
+    },
 ]
 
 
@@ -1011,6 +1117,21 @@ def call_tool(name, args):
             "domain": args.get("domain", ""),
             "data": args.get("data", {}),
         })
+
+    if name == "pressure":
+        return ask("pressure")
+
+    if name == "pet_traits":
+        return ask("pet")
+
+    if name == "pet_trait_set":
+        return ipc("petAct", dict(
+            {k: v for k, v in args.items() if v not in (None, "")},
+            action="set",
+        ))
+
+    if name == "pet_trait_remove":
+        return ipc("petAct", {"action": "remove", "id": args.get("id", "")})
 
     if name in ("capabilities", "overview", "health"):
         return ask(name)

@@ -33,7 +33,7 @@ punto funziona finche' non si toccano le opzioni, poi smette — in silenzio.
 
 **`pet/` non e' roba nostra.** E' Bitmochi di Ghaith Alsirawan (MIT), portato
 dentro come pannello: `Pet.js`, `Sprites.js` e `assets/` sono verbatim,
-`PetRoom.qml` ha otto modifiche e sono elencate una per una in
+`PetRoom.qml` ha dieci modifiche e sono elencate una per una in
 `pet/UPSTREAM.md`. Quell'elenco e' l'unica cosa che rende possibile prendere una
 versione nuova da monte, quindi chi tocca un file li' dentro lo aggiorna nello
 stesso commit. I commenti inglesi restano inglesi: sono guasti misurati

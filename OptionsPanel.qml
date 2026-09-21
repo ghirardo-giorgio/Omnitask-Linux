@@ -2263,7 +2263,7 @@ Rectangle {
 
                 text:
                     I18n.t(
-                        "La chiave di HealthBridge, quella scritta sotto l'indirizzo nell'app del telefono. La porta è aperta a chiunque sia sulla rete di casa, e la chiave è ciò che distingue questa dashboard da chiunque altro: senza, il telefono non risponde. Si riscrive qui quando la si rigenera sul telefono."
+                        "La chiave di HealthBridge: nell'app del telefono, sotto l'indirizzo, c'è il collegamento intero, e la chiave è quello che segue «?t=». La porta è aperta a chiunque sia sulla rete di casa, e la chiave è ciò che distingue questa dashboard da chiunque altro: senza, il telefono non risponde. Si riscrive qui quando la si rigenera sul telefono."
                     )
             }
 

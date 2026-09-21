@@ -118,6 +118,15 @@ ShellRoot {
             return Query.act(request);
         }
 
+        // Il terzo ingresso, e il terzo per la stessa ragione degli altri due:
+        // una porta per ogni cosa che puo' cambiare. `query` non tocca niente,
+        // `haAct` tocca Home Assistant, questo tocca le caratteristiche del pet
+        // — cioe' un file di configurazione di questa dashboard, che e' una
+        // cosa diversa dall'accendere una luce di casa.
+        function petAct(request: string): string {
+            return Query.petAct(request);
+        }
+
         function options(): void {
             host.optionsWindow.visible = !host.optionsWindow.visible;
         }

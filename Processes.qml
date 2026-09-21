@@ -16,7 +16,7 @@ Singleton {
 
     property var all: []
     property string query: ""
-    // cpu | rss | gpu | io | net | name
+    // cpu | rss | gpu | vram | io | net | name
     property string sortKey: "cpu"
     property bool sortDesc: true
     // Di chi mostrare i processi: tutti | miei | root. Su questa macchina i
@@ -217,6 +217,20 @@ Singleton {
     function clearSelected() {
         root.selected = ({});
     }
+
+    // Seleziona in una volta tutti i processi che il filtro corrente lascia
+    // passare: chiudere trecento righe una per una non e' l'uso che si fa
+    // di un filtro. I processi selezionati fuori dal filtro restano tali.
+    function selectAll() {
+        const next = Object.assign({}, root.selected);
+        for (const p of root.results)
+            next[p.pid] = p.name;
+        root.selected = next;
+    }
+
+    // Vero quando ogni risultato visibile e' selezionato: il pulsante che
+    // seleziona tutti e' anche il posto dove deselezionarli tutti.
+    readonly property bool allFilteredSelected: root.results.length > 0 && root.results.every(p => root.selected[p.pid] !== undefined)
 
     // Stessa azione su tutti i selezionati, in un solo avvio dello script: la
     // sequenza pid/nome viaggia come argomenti separati, cosi' nessun nome di

@@ -39,10 +39,16 @@ ColumnLayout {
             entity: "sensor.igrometro_umidita",
             toolDir: "~/Documents/Development/Python/Igrometer",
             terminal: "ptyxis",
+            camera: 0,
             chart: true
         })
     readonly property string entity: Settings.panelParam("igrometro", "entity", defs.entity)
     readonly property bool chart: Settings.panelParam("igrometro", "chart", defs.chart)
+    // Quale webcam guarda il quadrante. Sta nei panelParams e non nel codice
+    // perche' lo legge anche scripts/hygrometer.py, che ogni dieci minuti parte
+    // da systemd e non da qui: il numero e' lo stesso per la lettura a mano,
+    // per quella del timer e per la calibrazione.
+    readonly property int camera: Settings.panelParam("igrometro", "camera", defs.camera)
     readonly property string toolDir: Settings.panelParam("igrometro", "toolDir", defs.toolDir)
     readonly property string terminal: Settings.panelParam("igrometro", "terminal", defs.terminal)
 
@@ -136,6 +142,71 @@ ColumnLayout {
         return "#3fb950";
     }
 
+    // --- la webcam ----------------------------------------------------------
+    // L'elenco non si tiene fra un'apertura e l'altra: una webcam si attacca e
+    // si stacca, e un elenco di ieri offrirebbe una telecamera che non c'e'
+    // piu'. Si chiede quando si apre la tendina, che e' l'unico momento in cui
+    // serve.
+    property var cameras: []
+    property bool scanning: false
+    property bool picking: false
+
+    readonly property string cameraName: {
+        for (const w of root.cameras) {
+            if (w.indice === root.camera)
+                return w.nome;
+        }
+
+        // Non ancora cercate, o scelta una che adesso e' staccata: il nodo dice
+        // comunque di quale si tratta.
+        return "/dev/video" + root.camera;
+    }
+
+    function pickCamera(): void {
+        root.picking = !root.picking;
+
+        if (!root.picking || root.scanning)
+            return;
+
+        root.scanning = true;
+        finder.command = [root.python, PluginPaths.of("scripts/hygrometer.py"), "--cameras"];
+        finder.running = true;
+    }
+
+    function useCamera(index: int): void {
+        root.picking = false;
+
+        if (index === root.camera)
+            return;
+
+        Settings.setPanelParam("igrometro", "camera", index);
+        // L'inquadratura di prima non vale piu': il rettangolo del quadrante e
+        // il perno erano misurati su un'altra telecamera.
+        root.outcome = I18n.t("webcam cambiata: ricalibra");
+        root.outcomeColor = "#e3b341";
+        forget.restart();
+    }
+
+    Process {
+        id: finder
+
+        stdout: StdioCollector {
+            onStreamFinished: {
+                root.scanning = false;
+
+                let data;
+
+                try {
+                    data = JSON.parse(this.text);
+                } catch (e) {
+                    data = null;
+                }
+
+                root.cameras = data && data.ok ? data.webcam : [];
+            }
+        }
+    }
+
     // --- la lettura chiesta a mano -----------------------------------------
     property bool busy: false
     property string outcome: ""
@@ -148,7 +219,8 @@ ColumnLayout {
         root.busy = true;
         root.outcome = I18n.t("lettura…");
         root.outcomeColor = "#d29922";
-        meter.command = [root.python, PluginPaths.of("scripts/hygrometer.py")];
+        meter.command = [root.python, PluginPaths.of("scripts/hygrometer.py"),
+            "--camera", String(root.camera)];
         meter.running = true;
         guard.restart();
     }
@@ -160,7 +232,8 @@ ColumnLayout {
     // Dentro la sua cartella, perche' li' salva la taratura.
     function calibrate(): void {
         wizard.command = [root.terminal, "--new-window", "-d", root.dir, "--",
-            root.python, "main.py", "--recalibrate", "--no-log"];
+            root.python, "main.py", "--recalibrate", "--no-log",
+            "--camera", String(root.camera)];
         wizard.running = true;
         root.outcome = I18n.t("calibrazione aperta nel terminale");
         root.outcomeColor = "#58a6ff";
@@ -326,6 +399,75 @@ ColumnLayout {
                 hovered: aimHover.hovered
                 text: root.roughCalibration ? I18n.t("Taratura incompleta: calibra di nuovo")
                     : I18n.t("Calibra: apre la procedura in un terminale")
+            }
+        }
+
+        // L'obiettivo: quale delle webcam attaccate guarda il quadrante. Sta
+        // accanto al mirino perche' e' la stessa domanda vista da un altro
+        // lato — cosa si inquadra, e con cosa.
+        Text {
+            id: lens
+
+            color: root.picking ? "#58a6ff" : lensHover.hovered ? "#58a6ff" : "#484f58"
+            font.pixelSize: 12
+            text: "◉"
+
+            HoverHandler {
+                id: lensHover
+
+                cursorShape: Qt.PointingHandCursor
+            }
+
+            TapHandler {
+                onSingleTapped: root.pickCamera()
+            }
+
+            Tooltip {
+                hovered: lensHover.hovered
+                text: I18n.t("Webcam: %1 · toccala per cambiarla").arg(root.cameraName)
+            }
+        }
+    }
+
+    // La tendina delle webcam: si apre in mezzo al pannello invece che sopra,
+    // perche' qui una scheda sospesa dovrebbe uscire dal riquadro e questo
+    // pannello sta in una colonna che scorre.
+    ColumnLayout {
+        Layout.fillWidth: true
+        visible: root.picking
+        spacing: 2
+
+        Text {
+            Layout.fillWidth: true
+            elide: Text.ElideRight
+            color: "#8b949e"
+            font.pixelSize: 10
+            text: root.scanning ? I18n.t("cerco le webcam…") : root.cameras.length ? I18n.t("Cambiando webcam la calibrazione va rifatta") : I18n.t("nessuna webcam trovata")
+        }
+
+        Repeater {
+            model: root.cameras
+
+            Text {
+                required property var modelData
+
+                Layout.fillWidth: true
+                elide: Text.ElideRight
+                color: modelData.indice === root.camera ? "#3fb950" : pickHover.hovered ? "#58a6ff" : "#c9d1d9"
+                font.pixelSize: 11
+                // Il pallino segna quella in uso, il nodo distingue due
+                // telecamere che si chiamano allo stesso modo.
+                text: `${modelData.indice === root.camera ? "●" : "○"} ${modelData.nome} · ${modelData.nodo}`
+
+                HoverHandler {
+                    id: pickHover
+
+                    cursorShape: Qt.PointingHandCursor
+                }
+
+                TapHandler {
+                    onSingleTapped: root.useCamera(modelData.indice)
+                }
             }
         }
     }

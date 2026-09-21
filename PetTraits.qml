@@ -53,6 +53,16 @@ Singleton {
             unit: "%"
         },
         {
+            // Quanti telefoni risponde ADB adesso. Non e' una misura come le
+            // altre — e' un conteggio, e sale di uno per volta — ma e'
+            // esattamente la forma che serve alla meccanica «ogni tot»: con
+            // passo 1 e verso «sale di», ogni telefono che si collega fa
+            // cadere un oggetto, e uno che si scollega non fa niente.
+            key: "adbPhones",
+            label: I18n.t("Telefoni via ADB"),
+            unit: ""
+        },
+        {
             key: "memPct",
             label: I18n.t("RAM occupata"),
             unit: "%"
@@ -515,6 +525,14 @@ Singleton {
             switch (key) {
             case "cpu":
                 return SystemStats.cpu;
+            // 🔴 null finche' la prima risposta non e' arrivata, e non zero:
+            // zero vorrebbe dire «nessun telefono collegato», e la meccanica a
+            // passo lo leggerebbe come una salita da 0 appena arriva la
+            // risposta vera — un bonus regalato all'avvio per un telefono che
+            // era gia' li'. E' la stessa distinzione fra «non lo so» e «zero»
+            // che regge tutto il resto di questo file.
+            case "adbPhones":
+                return PhoneAdb.linksKnown ? PhoneAdb.connectedCount : null;
             case "memPct":
                 return SystemStats.mem.pct;
             case "cpuTemp":
@@ -673,7 +691,33 @@ Singleton {
             // catalogo ne' i ripieghi, e i minuti sono gia' millisecondi.
             drop: role !== "drop" ? null : ({
                     threshold: typeof t.threshold === "number" && isFinite(t.threshold) ? t.threshold : 0,
-                    when: t.dropWhen === "below" ? "below" : "above",
+                    // Quattro modi di far cadere una cosa, non due. I primi due
+                    // guardano DOVE STA il valore e vogliono che ci resti;
+                    // "rise" e "fall" guardano invece QUANTO SI E' MOSSO, e
+                    // cadono ogni `step` unita' percorse nella loro direzione.
+                    // La differenza non e' cosmetica: una batteria che si
+                    // carica passa da 20 a 80 una volta sola, quindi «sopra 50»
+                    // vale un oggetto per ricarica, mentre «sale di 500 mAh» ne
+                    // vale uno ogni 500 mAh — che e' il modo in cui si premia
+                    // una cosa che si accumula invece di una che sta ferma.
+                    when: t.dropWhen === "below" ? "below"
+                        : (t.dropWhen === "rise" || t.dropWhen === "fall" ? t.dropWhen : "above"),
+                    // Gia' risolto per chi consuma, come `item` e `gift`: la
+                    // stessa ragione per cui i minuti qui sotto sono
+                    // millisecondi. Chi legge non deve conoscere l'elenco dei
+                    // modi per sapere quale delle due meccaniche gli tocca.
+                    every: t.dropWhen === "rise" || t.dropWhen === "fall",
+                    // Quante unita' del sensore valgono un oggetto. Il ripiego
+                    // e' lo stesso passo che le molecole usano per contarsi —
+                    // un quarantesimo del campo, arrotondato a 1/2/5 — perche'
+                    // e' la stessa domanda: «ogni quanto, su questa scala, e'
+                    // un numero che si capisce».
+                    //
+                    // 🔴 Mai zero o negativo: e' il divisore della meccanica,
+                    // e un passo nullo vorrebbe dire un oggetto a ogni giro del
+                    // timer per sempre.
+                    step: typeof t.step === "number" && isFinite(t.step) && t.step > 0
+                          ? t.step : root.defaultStep(t.min ?? 0, t.max ?? 100),
                     // Un minimo di un secondo perche' una soglia con attesa
                     // zero, scritta a mano, farebbe cadere un oggetto a ogni
                     // giro del timer finche' la condizione resta vera.
@@ -830,8 +874,14 @@ Singleton {
     // riconoscono a colpo d'occhio.
     readonly property var particleTraits: root.wellnessTraits.filter(t => t.particles && t.value !== null)
 
-    // Le caratteristiche che vogliono una barra nella stanza. Le altre agiscono
-    // e basta.
+    // Le caratteristiche che vogliono una barra nella stanza.
+    //
+    // ⚠️ NESSUNO LA LEGGE PIU', e non e' una svista: da quando le statistiche
+    // stanno in una riga sola di icone in cima al pannello, le barre non
+    // esistono — vedi la modifica 9 in pet/UPSTREAM.md. Il campo `bar` resta
+    // nel catalogo e la sua spunta resta nelle opzioni per scelta, cosi' chi
+    // ce l'ha acceso non se lo vede sparire dal file; semplicemente non
+    // disegna niente. Chi rimette una vista per queste, riparta da qui.
     readonly property var barTraits: root.wellnessTraits.filter(t => t.bar)
 
     // ---- I valori di partenza di una caratteristica nuova ------------------
@@ -905,6 +955,10 @@ Singleton {
             role: "drop",
             threshold: base.bad,
             dropWhen: base.direction === "high" ? "below" : "above",
+            // Scritto anche quando il modo di partenza e' a soglia: chi passa
+            // dopo a «sale di» trova gia' un passo sensato invece di uno zero
+            // da correggere prima che la meccanica faccia qualcosa.
+            step: root.defaultStep(base.min ?? 0, base.max ?? 100),
             holdMinutes: 5,
             cooldownMinutes: 10,
             item: "chili",
@@ -937,6 +991,18 @@ Singleton {
 
     function remove(id: string) {
         root.save(root.traits.filter(t => t.id !== id));
+    }
+
+    // Il gambo dell'id, dalla sorgente: lettere e numeri, il resto diventa un
+    // trattino basso. E' stabile, si legge nel file e non cambia se poi si
+    // rinomina l'etichetta — la stessa regola degli id degli oggetti.
+    //
+    // Sta qui e non nella finestra perche' adesso ha due chiamanti: la finestra
+    // che aggiunge a mano e Query.petAct, che aggiunge per conto del server
+    // MCP. Due copie della stessa regex vorrebbero dire due id diversi per la
+    // stessa entita' a seconda di chi l'ha creata.
+    function idFor(source: string): string {
+        return source.replace(/^(ha:|sys:)/, "").replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").slice(0, 24) || "trait";
     }
 
     // Un id che nessun'altra caratteristica ha gia': due con lo stesso id si

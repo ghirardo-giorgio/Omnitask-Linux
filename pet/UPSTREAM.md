@@ -15,7 +15,7 @@ dentro come pannello della dashboard (`panels/PetPanel.qml`).
 | `Pet.js` | `Pet.js` | **verbatim** — `diff` vuoto |
 | `Sprites.js` | `Sprites.js` | **verbatim** — `diff` vuoto |
 | `assets/` | `assets/` | **verbatim** — 96 PNG, `diff -r` vuoto |
-| `PetRoom.qml` | `Room.qml` | **otto** modifiche, elencate sotto |
+| `PetRoom.qml` | `Room.qml` | **dieci** modifiche, elencate sotto |
 | `../panels/PetPanel.qml` | `Panel.qml` | **riscritto**: quello era la finestra flottante di Omarchy, che qui e' la colonna della dashboard. Solo la parte di stato e' portata, ed e' segnalata riga per riga |
 | — | `BarWidget.qml` | **non portato**: e' l'icona nella barra, e questa dashboard su GNOME una barra non ce l'ha |
 | — | `tools/`, `tests/`, `docs/` | non servono a chi non ritaglia gli sprite |
@@ -27,7 +27,7 @@ Qt — si incolla in `node` e gira), il secondo e' la mappa dei fotogrammi. Sono
 le due cose che a monte cambiano piu' spesso, e tenerle intatte vuol dire che
 un aggiornamento futuro e' una copia.
 
-## Le otto modifiche a `PetRoom.qml`
+## Le dieci modifiche a `PetRoom.qml`
 
 Quest'elenco e' il motivo per cui questo file esiste: senza, il giorno che a
 monte esce una versione nuova nessuno sa piu' cosa rimettere a mano.
@@ -61,27 +61,23 @@ monte esce una versione nuova nessuno sa piu' cosa rimettere a mano.
    con la stessa `Qt.resolvedUrl()` di tutti gli altri sprite — da `panels/`
    avrebbe cercato in `panels/assets/`, che non esiste.
 
-6. **Le caratteristiche dai sensori.** Tre proprieta' nuove sul root —
-   `extraStats`, `particleTraits` e `particleMax` — due `Repeater`
-   dentro `statsGrid` che riusa il `component StatBar` gia' li', e uno di
-   `PetMolecules` dentro `roomArea`, dietro al pet — uno per caratteristica
-   che chiede le molecole, perche' due nuvole diverse convivono benissimo.
+6. **Le caratteristiche dai sensori.** Due proprieta' nuove sul root —
+   `particleTraits` e `particleMax` — e un `Repeater` di `PetMolecules` dentro
+   `roomArea`, dietro al pet: uno per caratteristica che chiede le molecole,
+   perche' due nuvole diverse convivono benissimo.
 
-   `StatBar` ha guadagnato due campi: `readout`, che sostituisce il numero
-   quando la barra viene da un sensore (li' la percentuale e' il benessere
-   calcolato, e cio' che serve leggere e' «1120 ppm»), e `unknown`, per il
-   sensore che non risponde — che non e' zero, e una barra vuota lo dice mentre
-   una barra a zero direbbe «sta malissimo».
+   ⚠️ Questa modifica era piu' grande: c'erano anche `extraStats` e un secondo
+   `Repeater` che dava una barra a ogni caratteristica dentro la griglia delle
+   statistiche, e `StatBar` aveva guadagnato `readout` e `unknown` per il
+   valore vero e per il sensore che non risponde. La **modifica 9** ha portato
+   via le barre tutte insieme, quelle del gioco e quelle dai sensori, quindi
+   qui adesso restano le sole molecole. Il campo `bar` del catalogo e la sua
+   spunta nelle opzioni ci sono ancora e non fanno niente — c'e' scritto in
+   `PetTraits.qml`, accanto a `barTraits`.
 
    Questo file continua a non decidere niente: `PetTraits` calcola,
    `panels/PetPanel.qml` passa, qui si disegna. `PetMolecules.qml` sta nella
    radice e non qui, perche' e' roba nostra.
-
-   Sulla geometria non serve altro: `chromeHeight` somma gia'
-   `statsGrid.implicitHeight`, quindi la griglia che cresce restringe la stanza
-   da se' e `spriteScale` si rifa'. E' il progetto dell'autore che regge — ed
-   e' anche il motivo per cui dopo una modifica qui si guarda il log: quelle
-   catene sono tenute aperte apposta per non chiudersi in un ciclo di binding.
 
 7. **Il pavimento e' un grafico, e c'e' un fondale.** Tre proprieta' nuove —
    `terrainValues`, `terrainRise`, `background` — piu' la funzione
@@ -111,6 +107,27 @@ monte esce una versione nuova nessuno sa piu' cosa rimettere a mano.
    `terrainOpacity`): sopra un fondale scelto dall'utente il grigio del tema
    puo' sparire, e allora si sceglie.
 
+   La prospettiva e' la stessa modifica vista dall'altro lato: `terrainDepth`
+   e la proprieta' derivata `depthScale` — quanto il pet e' lontano nel punto
+   in cui sta, 1 nella valle e `1 - terrainDepth` sulla cima — piu' un secondo
+   `Scale` nella lista `transform` di `petGrid`, con l'origine sui PIEDI
+   invece che al centro come quello dello specchio. Il tetto e' 1: il pet non
+   diventa mai piu' grande della misura che `spriteScale` gli ha dato, perche'
+   quel numero e' un budget sull'altezza della stanza e scavalcarlo vuol dire
+   il pet tagliato da `roomArea.clip`.
+
+   Con questa c'e' `petTopY()`, che e' la cima VISIVA del pet: gli effetti
+   fratelli di `petGrid` — il cuore e il segno del sonno — partivano da
+   `petGrid.y`, che con la scala attorno ai piedi non e' piu' dove sta la
+   testa. Col terreno spento o `terrainDepth: 0` vale `petGrid.y`, cioe' il
+   numero di prima.
+
+   ⚠️ Qui la nitidezza intera di `spriteScale` si paga per scelta: la scala
+   della prospettiva e' frazionaria per definizione. Non e' in contraddizione
+   con il resto del file — quello e' la misura di riposo del pet, questa e' il
+   pet in cammino su una collina — ma chi porta su una versione nuova sappia
+   che e' una deroga voluta, non una svista.
+
    Il disegno della curva sta in `../PetTerrain.qml`, che e' roba nostra.
 
 8. **Gli oggetti che cadono.** Due proprieta' nuove sul root — `drops` e
@@ -132,6 +149,68 @@ monte esce una versione nuova nessuno sa piu' cosa rimettere a mano.
    Sulla geometria non serve niente di nuovo: la misura e' `petH / 3` e il
    suolo lo da' `groundY()` della modifica 7, cioe' i due numeri che questo
    file gia' aveva.
+
+9. **Le statistiche sono una riga di icone in cima, e non ci sono piu' barre.**
+   Il `component StatBar` — etichetta piu' rettangolo — e' sostituito da
+   `component StatCell`, e la `Grid` a due colonne che stava SOTTO la stanza da
+   una `Row` di quattro celle subito sotto l'intestazione. Ogni cella e'
+   un'emoji e un numero: 🍗 fame, ⚡ energia, 😊 felicita', 🧼 pulizia.
+
+   Le barre costavano quattro righe di chrome e le pagava la stanza, che e' la
+   cosa che si guarda — dentro ci cammina il pet sul grafico della modifica 7.
+   Con una riga sola il chrome cala di una ventina di pixel, e `heightScale`
+   puo' rispondere con un passo di scala in piu': **il pet puo' venire piu'
+   grande**, ed e' voluto.
+
+   Le celle sono larghe un quarto della riga ognuna, non spaziate: il numero
+   sta sempre nello stesso posto e la riga non balla quando una statistica
+   passa da 98 a 100. E sono scritte a mano, non generate da un modello, per la
+   stessa ragione per cui lo erano le barre.
+
+   L'icona e il numero sono due `Text` distinti perche' hanno misure diverse:
+   l'emoji resta a `PetStyle.font.body` (a 8 px non si riconosce, ed e' l'unica
+   cosa che dice di quale statistica sia il numero, visto che le etichette non
+   ci sono piu') e il numero va in **Press Start 2P a 8 px**, che e' il font
+   arcade caricato da `../PetStyle.qml` — `fonts/` nella radice, OFL, roba
+   nostra. La soglia d'allarme che era il colore della barra e' passata sul
+   numero: sotto 20 diventa `PetColor.urgent`.
+
+   ⚠️ Il font arcade sta sui NUMERI e non su tutto il pannello. A 8 px
+   monospaziati «Sta molto male — ha bisogno di cure adesso» e' gia' larga
+   quanto la colonna in italiano, e nelle altre cinque lingue di piu': gli
+   avvisi, i pulsanti e il cartellino restano nel font della dashboard.
+
+   Sulla geometria cambiano due nomi e nient'altro: `stableChrome` e
+   `chromeHeight` sommavano `statsGrid.implicitHeight` e adesso sommano
+   `statsRow.implicitHeight`. Le catene restano quelle, e restano aperte.
+
+10. **Il cartellino di che cosa e' caduto, e l'interruttore dei suoni.** Tre
+    proprieta' nuove sul root — `notice`, `noticeSeconds`, `soundOn` — un
+    segnale (`soundToggled`), un `Rectangle` in cima a `roomArea` e un quinto
+    pulsante nella riga delle cure.
+
+    Il cartellino dice **perche'** e' arrivato un oggetto: «🔋 Solare carica
+    +500 mAh». Senza, con cinque caratteristiche attive un oggetto che compare
+    e' una sorpresa invece di un riscontro — e le caratteristiche a passo
+    (modifica del catalogo, non di questo file) rendono la cosa frequente.
+    Arriva gia' scritto dal pannello, come `drops`: questo file non conosce le
+    caratteristiche e non deve conoscerle per disegnare una riga di testo.
+
+    🔴 E' dichiarato per ULTIMO fra i figli della stanza: in QML l'ordine di
+    dichiarazione e' l'ordine di disegno, e sotto ci finirebbe proprio nel
+    momento in cui c'e' qualcosa da leggere.
+
+    L'interruttore e' un'icona sola (🔊 / 🔇) e nessuna parola: sta in fondo a
+    una riga che in tedesco e' gia' al limite della colonna. Non e' disabilitato
+    durante la cerimonia, al contrario delle quattro cure: quelle agiscono sul
+    pet, questo e' un interruttore dell'interfaccia, e chi si prende un suono a
+    sorpresa deve poterlo spegnere anche li'.
+
+    ⚠️ I suoni NON stanno in questo file. Il tonfo e la raccolta li fa
+    `../PetDrops.qml` dove i due fatti succedono, il preavviso lo fa il
+    pannello quando decide la caduta, e li riproduce `../PetSfx.qml` — tutta
+    roba nostra. Qui c'e' solo il pulsante che dice al pannello di cambiare
+    idea.
 
 
 ## Il `qmldir`, che nell'originale non c'era
@@ -165,5 +244,5 @@ cp /tmp/bitmochi/Pet.js /tmp/bitmochi/Sprites.js pet/
 cp -r /tmp/bitmochi/assets pet/
 ```
 
-Poi le otto modifiche qui sopra su `Room.qml` nuovo, e `touch shell.qml` —
+Poi le dieci modifiche qui sopra su `Room.qml` nuovo, e `touch shell.qml` —
 gli asset e i `.js` non fanno ricaricare la shell da soli.

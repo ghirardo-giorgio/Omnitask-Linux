@@ -88,7 +88,7 @@ Rectangle {
     // La struttura deve corrispondere esattamente all'intestazione:
     //
     // | checkbox | processo | spazio elastico |
-    // | CPU | MEM | GPU | DISCO | RETE | azione |
+    // | CPU | MEM | GPU | VRAM | DISCO | RETE | azione |
     // =============================================================
 
     RowLayout {
@@ -416,55 +416,60 @@ Rectangle {
         // GPU
         // =========================================================
 
-        ColumnLayout {
+        Text {
             Layout.minimumWidth: row.metricWidth
             Layout.preferredWidth: row.metricWidth
             Layout.maximumWidth: row.metricWidth
 
             visible: !row.confirming
 
-            spacing: 0
+            horizontalAlignment: Text.AlignRight
 
-            Text {
-                readonly property var gpu:
-                    row.process.gpu
+            color:
+                row.process.gpu > 0
+                ? "#a371f7"
+                : "#484f58"
 
-                Layout.fillWidth: true
+            font.pixelSize: 11
 
-                horizontalAlignment: Text.AlignRight
+            text:
+                row.process.gpu === null
+                || row.process.gpu === undefined
+                ? "—"
+                : `${row.process.gpu}%`
+        }
 
-                color:
-                    gpu > 0
-                    ? "#a371f7"
-                    : "#484f58"
+        // =========================================================
+        // VRAM
+        //
+        // Prima era la riga secondaria della colonna GPU: una GPU ferma
+        // sugli SM si distingue solo da quanta memoria tiene occupata.
+        // =========================================================
 
-                font.pixelSize: 11
+        Text {
+            Layout.minimumWidth: row.metricWidth
+            Layout.preferredWidth: row.metricWidth
+            Layout.maximumWidth: row.metricWidth
 
-                text:
-                    gpu === null
-                    || gpu === undefined
-                    ? "—"
-                    : `${gpu}%`
-            }
+            visible: !row.confirming
 
-            Text {
-                Layout.fillWidth: true
+            horizontalAlignment: Text.AlignRight
 
-                visible:
-                    (row.process.vram ?? 0) > 0
+            color:
+                row.process.vram > 0
+                ? "#a371f7"
+                : "#484f58"
 
-                horizontalAlignment: Text.AlignRight
+            font.pixelSize: 11
 
-                color: "#484f58"
-
-                font.pixelSize: 9
-
-                text:
-                    SystemStats.formatBytes(
-                        row.process.vram,
-                        false
-                    )
-            }
+            text:
+                row.process.vram === null
+                || row.process.vram === undefined
+                ? "—"
+                : SystemStats.formatBytes(
+                      row.process.vram,
+                      false
+                  )
         }
 
         // =========================================================

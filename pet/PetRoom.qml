@@ -87,21 +87,10 @@ Item {
   signal dropCaught(string key)
   signal dropExpired(string key)
 
-  // ---- Aggiunto dal porting (modifica 6): le caratteristiche dai sensori --
-  //
-  // Le quattro statistiche qui sotto sono del gioco e decadono da sole; queste
-  // vengono da fuori — la CO2 della stanza, la temperatura della CPU — e si
-  // disegnano con le stesse barre perche' si leggono insieme. Le calcola
-  // PetTraits, le passa panels/PetPanel.qml.
-  //
-  // La forma di ogni voce e' quella di PetTraits.list: serve `label`,
-  // `wellness` (0-100), `text` (il valore vero con l'unita') e `critical`.
-  property var extraStats: []
-
   // Le caratteristiche da disegnare come molecole nell'aria, e il tetto di
-  // ognuna. Arrivano dal pannello come `extraStats`, invece che lette da
-  // PetTraits qui dentro: questo file disegna e basta, chi sceglie cosa
-  // mostrare sta fuori, come per `pet`.
+  // ognuna. Arrivano dal pannello invece che lette da PetTraits qui dentro:
+  // questo file disegna e basta, chi sceglie cosa mostrare sta fuori, come
+  // per `pet`.
   //
   // Plurale, e non per completezza: era singolare e con due caratteristiche a
   // molecole accese la seconda non disegnava niente.
@@ -117,6 +106,25 @@ Item {
   property var drops: []
   property int dropSeconds: 6
 
+  // ---- Aggiunto dal porting (modifica 10): il cartellino e i suoni --------
+  //
+  // Che cosa e' appena caduto e perche', gia' scritto: `{ glyph, text, kind }`
+  // — «🔋 Solare carica +500 mAh». Arriva risolto dal pannello per la stessa
+  // ragione di `drops`: questo file non conosce le caratteristiche, e non deve
+  // conoscerle per disegnare una riga di testo. Nullo = nessun cartellino.
+  property var notice: null
+
+  // Quanto resta a schermo. Quattro secondi: meno non basta a leggere una riga
+  // se si stava guardando altro, di piu' e' un'etichetta appiccicata sopra la
+  // stanza mentre l'oggetto e' gia' a terra da un pezzo.
+  property int noticeSeconds: 4
+
+  // Se i suoni sono accesi. Lo stato non e' nostro — sta nei panelParams e lo
+  // scrive il pannello — perche' questa e' la stanza, non le impostazioni: qui
+  // si disegna un pulsante premuto o no.
+  property bool soundOn: true
+  signal soundToggled
+
   // ---- Aggiunto dal porting (modifica 7): il pavimento e' un grafico ------
   //
   // La serie su cui camminare — storico di Home Assistant o misura di sistema,
@@ -124,6 +132,22 @@ Item {
   // quella di prima: pavimento piatto e nessuno sfondo.
   property var terrainValues: []
   property real terrainRise: 0.4
+
+  // ---- Aggiunto dal porting (modifica 7): la profondita' del rilievo ------
+  //
+  // Quanto il pet rimpicciolisce salendo sulla curva: 0 lo lascia della stessa
+  // misura dappertutto — il comportamento di prima — e 0.25 vuol dire che in
+  // cima al rilievo e' i tre quarti di quanto e' nella valle. E' l'unica cosa
+  // che da' profondita' a una stanza disegnata di lato: la cima della collina
+  // e' il fondo, e una cosa in fondo e' piu' piccola.
+  //
+  // 🔴 Il tetto e' 1, cioe' il pet non diventa mai piu' GRANDE della misura
+  // che `spriteScale` gli ha dato. Quel numero e' un budget: e' calcolato
+  // sull'altezza che resta alla stanza, e ingrandire oltre vorrebbe dire
+  // scavalcarlo — con `roomArea.clip` a tagliare la testa del pet nella valle
+  // dei pannelli bassi. Piu' vicino qui vuol dire «meno lontano», non «piu'
+  // grande del normale».
+  property real terrainDepth: 0.25
   // Il colore del rilievo e quanto lascia vedere. Vuoto = quello del tema, che
   // e' il grigio del testo: sopra un fondale scelto da chi usa la dashboard
   // puo' non andare bene, e allora si sceglie.
@@ -140,6 +164,33 @@ Item {
     if (!terrainShape.active)
       return baseboard.y;
     return terrainShape.y + terrainShape.surfaceY(fracX);
+  }
+
+  // Quanto e' lontano il pet nel punto in cui si trova: 1 sul fondo della
+  // valle, `1 - terrainDepth` in cima al rilievo. Col terreno spento e' 1
+  // sempre, quindi la stanza torna esattamente quella di prima.
+  //
+  // 🔴 Sulla FORMA della curva (`heightAt`, che e' gia' normalizzata sulla
+  // serie) e non sui pixel che il rilievo occupa davvero: se dipendesse anche
+  // da `terrainRise`, abbassare il rilievo perche' ci stia il pet
+  // spegnerebbe di riflesso la prospettiva. E' la stessa scelta che
+  // PetTerrain fa per la curva — qui interessa la forma, la misura sta sulla
+  // barra.
+  //
+  // ⚠️ L'uovo si misura a meta' stanza perche' e' li' che sta: il suo `y`
+  // chiama `groundY(0.5)`, non `groundY(petFracX)`, e leggere due punti
+  // diversi vorrebbe dire un uovo scalato per una collina su cui non poggia.
+  //
+  // ⚠️ Nessun `Behavior`: mentre il pet cammina questo insegue `petFracX`,
+  // che e' gia' animato, e quando arriva un campione nuovo salta quanto salta
+  // il suolo sotto i piedi — cioe' insieme a `groundY`, che e' l'unico modo
+  // per cui i piedi restino sulla curva.
+  readonly property real depthScale: {
+    const d = Math.max(0, Math.min(1, root.terrainDepth));
+    if (!terrainShape.active || d <= 0)
+      return 1;
+    const f = root.pet.stage === "egg" ? 0.5 : root.petFracX;
+    return 1 - d * terrainShape.heightAt(f);
   }
 
   // 🔴 Both dimensions are supplied by the panel (which anchors this to fill
@@ -259,7 +310,7 @@ Item {
   readonly property real stableChrome: Math.ceil(
       headerRow.implicitHeight
     + Math.max(hatchText.implicitHeight, sickText.implicitHeight)
-    + statsGrid.implicitHeight
+    + statsRow.implicitHeight
     + actionsRow.implicitHeight
     + mainColumn.spacing * 4)
 
@@ -282,7 +333,7 @@ Item {
     var h = headerRow.implicitHeight
     if (hatchText.visible) { h += hatchText.implicitHeight; n++ }
     if (sickText.visible) { h += sickText.implicitHeight; n++ }
-    if (statsGrid.visible) { h += statsGrid.implicitHeight; n++ }
+    if (statsRow.visible) { h += statsRow.implicitHeight; n++ }
     if (actionsRow.visible) { h += actionsRow.implicitHeight; n++ }
     // ⚠️ Rounded UP, and this is not cosmetic. Text.implicitHeight is a real
     // — 18.5 px is normal — so an unrounded sum puts roomArea's HEIGHT on a
@@ -801,9 +852,20 @@ Item {
   // ---- Click-the-pet reaction: the interaction that has to feel
   //      better than anything else here. Immediate — it does not wait for
   //      Panel.qml's round trip through Pet.applyPet() before playing.
+  // 🔴 Aggiunto dal porting (modifica 7): la cima VISIVA del pet, che con la
+  // prospettiva accesa non e' piu' `petGrid.y`. Lo Scale della profondita'
+  // rimpicciolisce attorno ai piedi, quindi la testa scende di tutta l'altezza
+  // persa e un cuore fatto partire dal bordo dell'Item resterebbe a mezz'aria
+  // sopra un pet che non c'e' — proprio nella valle in cui il pet e' piu'
+  // grande no, ma sulla collina si'. Con `terrainDepth: 0` o terreno spento
+  // vale `petGrid.y`, cioe' esattamente il numero di prima.
+  function petTopY() {
+    return petGrid.y + petGrid.height * (1 - root.depthScale)
+  }
+
   function burstHeart() {
     heartEffect.x = Math.round(petGrid.x + petGrid.width / 2 - heartEffect.width / 2)
-    heartEffect.y = Math.round(petGrid.y - root.unit)
+    heartEffect.y = Math.round(root.petTopY() - root.unit)
     heartEffect.targetY = heartEffect.y - root.unit * 3
     heartEffect.opacity = 1
     heartAnim.restart()
@@ -821,7 +883,7 @@ Item {
 
   function burstSleepMark() {
     sleepEffect.x = Math.round(petGrid.x + petGrid.width / 2 - sleepEffect.width / 2)
-    sleepEffect.y = Math.round(petGrid.y - root.unit)
+    sleepEffect.y = Math.round(root.petTopY() - root.unit)
     sleepEffect.targetY = sleepEffect.y - root.unit * 3
     sleepEffect.opacity = 1
     sleepAnim.restart()
@@ -949,6 +1011,31 @@ Item {
           font.pixelSize: PetStyle.font.body
         }
       }
+    }
+
+    // ---- Stats (modifica 9 del porting) -----------------------------------
+    //
+    // Una riga sola, in cima, senza barre: un'icona e il numero. Le barre
+    // costavano quattro righe di chrome — due righe di griglia, testo piu'
+    // barra ognuna — e le pagava la stanza, che e' la cosa che si guarda.
+    //
+    // 🔴 Quattro celle di larghezza UGUALE (`width / 4`) invece di un Row
+    // spaziato: cosi' il numero sta sempre nello stesso posto e la riga non
+    // balla quando una statistica passa da 98 a 100. Sono scritte a mano, non
+    // generate da un modello, per la stessa ragione per cui lo erano le barre —
+    // un modello JS ricostruito a ogni cambio di statistica ricreerebbe i
+    // delegate una volta al secondo.
+    Row {
+      id: statsRow
+      visible: root.pet.stage !== "egg"
+      width: parent.width
+      height: Math.ceil(implicitHeight)   // whole pixels — see chromeHeight
+      spacing: 0
+
+      StatCell { icon: "🍗"; value: root.pet.hunger; width: statsRow.width / 4 }
+      StatCell { icon: "⚡"; value: root.pet.energy; width: statsRow.width / 4 }
+      StatCell { icon: "😊"; value: root.pet.happiness; width: statsRow.width / 4 }
+      StatCell { icon: "🧼"; value: root.pet.hygiene; width: statsRow.width / 4 }
     }
 
     Text {
@@ -1215,10 +1302,48 @@ Item {
         //
         // 🔴 Gated on the stage: an egg has no direction, and a pet that
         // died facing left must not leave its successor's egg mirrored.
-        transform: Scale {
-          origin.x: petGrid.width / 2
-          xScale: root.facingLeft && root.pet.stage !== "egg" ? -1 : 1
-        }
+        //
+        // 🔴 Aggiunto dal porting (modifica 7): il secondo Scale e' la
+        // PROSPETTIVA — il pet in cima al rilievo e' lontano, e una cosa
+        // lontana e' piu' piccola. Sta in una lista insieme allo specchio
+        // invece che dentro di esso perche' i due hanno origini diverse e
+        // ragioni diverse: lo specchio gira attorno al centro, questo
+        // rimpicciolisce attorno ai PIEDI (`origin.y: petGrid.height`), che e'
+        // l'unica origine per cui il pet resta appoggiato al suolo mentre
+        // cambia misura. Con l'origine al centro si staccherebbe dalla curva
+        // di mezza altezza persa, ed e' proprio la cosa che `groundY()`
+        // esiste per non far succedere.
+        //
+        // ⚠️ I due commutano, quindi l'ordine nella lista non conta: lo
+        // specchio e' ±1 attorno a `width / 2` e la scala e' uniforme attorno
+        // a un'origine che sta sulla stessa ascissa. Verificato in aritmetica,
+        // non lasciato al caso — e vale anche per `eggBump`, che anima la
+        // `scale` dell'Item attorno al suo centro.
+        //
+        // ⚠️ QUI la nitidezza si paga, ed e' voluto: `spriteScale` e' intero
+        // apposta perche' un ingrandimento frazionario da' pixel di larghezza
+        // diversa, e questo e' frazionario per definizione. La differenza e'
+        // che quello e' la misura di riposo del pet — quella che si guarda
+        // ferma — e questo e' il pet che cammina su una collina: si vede il
+        // movimento, non la griglia. Con `terrainDepth: 0` non esiste, e con
+        // il terreno spento non e' mai diverso da 1.
+        transform: [
+          Scale {
+            origin.x: petGrid.width / 2
+            xScale: root.facingLeft && root.pet.stage !== "egg" ? -1 : 1
+          },
+          Scale {
+            origin.x: petGrid.width / 2
+            origin.y: petGrid.height
+            // ⚠️ Nessun `Behavior` su questi due, e non per dimenticanza: il
+            // valore insegue `petFracX`, che e' gia' animato, quindi un
+            // Behavior riavvierebbe un'animazione a ogni fotogramma della
+            // camminata — e la scala arriverebbe sulla cima della collina
+            // dopo i piedi, che sul suolo non sono animati.
+            xScale: root.depthScale
+            yScale: root.depthScale
+          }
+        ]
         // ⚠️ Rounded. An integer SIZE is only half of crisp pixel art: drawn
         // at a fractional x the same texture is sampled half a pixel off and
         // the edges shimmer as the pet walks.
@@ -1526,45 +1651,89 @@ Item {
         NumberAnimation { target: sleepEffect; property: "opacity"; to: 0; duration: 900; easing.type: Easing.InQuad }
         NumberAnimation { target: sleepEffect; property: "y"; to: sleepEffect.targetY; duration: 900; easing.type: Easing.OutQuad }
       }
-    }
 
-    // ---- Stats -----------------------------------------------------------
-    Grid {
-      id: statsGrid
-      visible: root.pet.stage !== "egg"
-      width: parent.width
-      columns: 2
-      rowSpacing: PetStyle.spacing.xs
-      columnSpacing: PetStyle.spacing.sm
-      StatBar { label: I18n.t("Fame"); value: root.pet.hunger; barWidth: (root.width - PetStyle.spacing.sm) / 2 - 4 }
-      StatBar { label: I18n.t("Energia"); value: root.pet.energy; barWidth: (root.width - PetStyle.spacing.sm) / 2 - 4 }
-      StatBar { label: I18n.t("Felice"); value: root.pet.happiness; barWidth: (root.width - PetStyle.spacing.sm) / 2 - 4 }
-      StatBar { label: I18n.t("Pulito"); value: root.pet.hygiene; barWidth: (root.width - PetStyle.spacing.sm) / 2 - 4 }
-
-      // Aggiunto dal porting (modifica 6): le caratteristiche dai sensori,
-      // nella stessa griglia delle quattro di casa perche' si guardano
-      // insieme — quale delle due famiglie sta facendo star male il pet non
-      // deve costare un secondo posto dove cercare.
+      // ---- Aggiunto dal porting (modifica 10): il cartellino di che cosa e'
+      //      caduto, in cima alla stanza.
       //
-      // 🔴 `modelData` e' DICHIARATO, come nel Repeater dello sporco qui
-      // sopra: con `pragma ComponentBehavior: Bound` un modelData non
-      // dichiarato non arriva affatto.
-      Repeater {
-        model: root.extraStats
+      // 🔴 Dichiarato per ULTIMO fra i figli della stanza, e non e' un caso:
+      // in QML l'ordine di dichiarazione e' l'ordine di disegno, e questo deve
+      // stare sopra il pet, gli oggetti e le molecole — sotto ci finirebbe
+      // proprio nel momento in cui c'e' qualcosa da leggere.
+      Rectangle {
+        id: noticeCard
 
-        delegate: StatBar {
-          required property var modelData
+        // Il testo si tiene anche quando `notice` torna nullo: la dissolvenza
+        // dura piu' del cambio, e senza questa copia l'ultimo mezzo secondo di
+        // cartellino sarebbe un rettangolo vuoto.
+        property var shown: null
 
-          label: modelData.label
-          // La barra segue il BENESSERE, non il valore grezzo: cosi' «pieno e'
-          // bene» vale per tutte e otto le barre, anche per una come la CO2
-          // dove il valore buono e' quello basso.
-          value: modelData.wellness === null ? 0 : modelData.wellness
-          // Ma il numero scritto e' quello vero. Un benessere all'82% non dice
-          // cosa andare a cambiare; «1120 ppm» si'.
-          readout: modelData.text
-          unknown: modelData.wellness === null
-          barWidth: (root.width - PetStyle.spacing.sm) / 2 - 4
+        anchors.horizontalCenter: parent.horizontalCenter
+        anchors.top: parent.top
+        anchors.topMargin: root.unit
+        width: Math.min(parent.width - root.unit * 2, noticeRow.implicitWidth + root.unit * 2)
+        height: noticeRow.implicitHeight + root.unit
+        radius: PetStyle.cornerRadius
+        color: Qt.rgba(PetColor.surface.r, PetColor.surface.g, PetColor.surface.b, 0.92)
+        border.width: 1
+        border.color: noticeCard.shown && noticeCard.shown.kind === "malus" ? PetColor.urgent : PetColor.accent
+
+        opacity: 0
+        // Invisibile vuol dire anche fuori dai clic: il cartellino sta sopra la
+        // stanza, e la stanza si clicca per accarezzare il pet.
+        visible: opacity > 0
+
+        Behavior on opacity {
+          NumberAnimation { duration: 220; easing.type: Easing.InOutQuad }
+        }
+
+        Timer {
+          id: noticeTimer
+
+          interval: root.noticeSeconds * 1000
+          onTriggered: noticeCard.opacity = 0
+        }
+
+        Connections {
+          target: root
+
+          function onNoticeChanged() {
+            if (!root.notice) {
+              noticeCard.opacity = 0;
+              return;
+            }
+            noticeCard.shown = root.notice;
+            noticeCard.opacity = 1;
+            noticeTimer.restart();
+          }
+        }
+
+        Row {
+          id: noticeRow
+
+          anchors.centerIn: parent
+          spacing: PetStyle.spacing.xs
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            text: noticeCard.shown ? noticeCard.shown.glyph : ""
+            // La stessa scelta della riga delle statistiche: l'emoji alla
+            // misura del corpo, perche' alla misura del font arcade non si
+            // riconoscerebbe piu'.
+            font.family: "Noto Color Emoji"
+            font.pixelSize: PetStyle.font.body
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.min(implicitWidth, roomArea.width - root.unit * 4 - PetStyle.font.body * 2)
+            elide: Text.ElideRight
+            text: noticeCard.shown ? noticeCard.shown.text : ""
+            color: PetColor.foreground
+            font.family: PetStyle.arcadeFamily
+            font.pixelSize: PetStyle.arcadeBody
+          }
         }
       }
     }
@@ -1582,6 +1751,20 @@ Item {
         text: I18n.t("Dormi")
         enabled: !root.memorialPending
         onClicked: { root.burstSleepMark(); root.careRequested("sleep") }
+      }
+
+      // Aggiunto dal porting (modifica 10). Un'icona sola e nessuna parola,
+      // per due ragioni: sta in fondo a una riga che in tedesco e' gia' al
+      // limite della colonna, e il simbolo dell'altoparlante barrato dice da
+      // solo quello che direbbe la parola, in tutte e sei le lingue.
+      //
+      // ⚠️ Non e' disabilitato durante la cerimonia, al contrario delle quattro
+      // cure: quelle agiscono sul pet — che in quel momento e' morto — mentre
+      // questo e' un interruttore dell'interfaccia, e uno che si prende un
+      // suono a sorpresa deve poterlo spegnere anche li'.
+      Button {
+        text: root.soundOn ? "🔊" : "🔇"
+        onClicked: root.soundToggled()
       }
     }
   }
@@ -1747,42 +1930,60 @@ Item {
   // `statBar`. Unqualified they resolved by walking the scope chain, which
   // works but is the same "it is found somewhere out there" pattern that hid
   // the delegate bug — and it is what qmllint was flagging alongside it.
-  component StatBar: Column {
-    id: statBar
-    required property string label
+  // Una statistica nella riga in cima: l'icona e il numero, e nient'altro —
+  // il `component StatBar` che stava qui, etichetta piu' barra, non c'e' piu'.
+  component StatCell: Item {
+    id: cell
+    required property string icon
     required property real value
-    property real barWidth: 120
-    // Aggiunti dal porting (modifica 6). `readout` sostituisce il numero
-    // quando la barra viene da un sensore: li' la percentuale e' il benessere
-    // calcolato, e quello che serve leggere e' la misura vera. `unknown` e' il
-    // caso in cui il sensore non risponde — che non e' zero, ed e' l'unica
-    // ragione per cui questa distinzione esiste.
-    property string readout: ""
-    property bool unknown: false
-    spacing: 2
-    Text {
-      textFormat: Text.PlainText
-      text: statBar.readout !== "" ? statBar.label + " " + statBar.readout
-                                   : statBar.label + " " + Math.round(statBar.value)
-      color: statBar.unknown ? Qt.rgba(PetColor.foreground.r, PetColor.foreground.g, PetColor.foreground.b, 0.45)
-                             : PetColor.foreground
-      font.family: PetStyle.font.family
-      font.pixelSize: PetStyle.font.body
-      elide: Text.ElideRight
-      width: statBar.barWidth
-    }
-    Rectangle {
-      width: statBar.barWidth
-      height: 6
-      radius: 3
-      color: Qt.rgba(PetColor.foreground.r, PetColor.foreground.g, PetColor.foreground.b, 0.16)
-      Rectangle {
-        // Una barra che non si sa e' vuota, non a zero: a zero vorrebbe dire
-        // «sta malissimo», e un sensore staccato non e' una diagnosi.
-        width: statBar.unknown ? 0 : parent.width * Math.max(0, Math.min(1, statBar.value / 100))
-        height: parent.height
-        radius: 3
-        color: statBar.value <= 20 ? PetColor.urgent : PetColor.accent
+
+    implicitHeight: cellGroup.implicitHeight
+
+    // Il gruppo icona+numero, centrato nella cella. Le due misure sono diverse
+    // apposta — vedi sotto — quindi si allineano al centro l'una dell'altra e
+    // non a una baseline comune, che con un glifo bitmap a colori non vuol dire
+    // niente.
+    //
+    // ⚠️ Le anchors stanno QUI DENTRO e non sui figli di un Row: i figli di un
+    // positioner non possono usare le anchors, e Qt lo dice a runtime — una
+    // riga di log invece di un layout.
+    Item {
+      id: cellGroup
+      anchors.centerIn: parent
+      implicitWidth: iconText.implicitWidth + PetStyle.spacing.xs + valueText.implicitWidth
+      implicitHeight: Math.max(iconText.implicitHeight, valueText.implicitHeight)
+      width: implicitWidth
+      height: implicitHeight
+
+      Text {
+        textFormat: Text.PlainText
+        id: iconText
+        anchors.left: parent.left
+        anchors.verticalCenter: parent.verticalCenter
+        text: cell.icon
+        // 🔴 Alla misura del CORPO e non a quella del font arcade: a 8 px
+        // un'emoji non si riconosce piu', e l'icona qui e' l'unica cosa che
+        // dice DI QUALE statistica sia il numero — le etichette non ci sono
+        // piu'. La famiglia e' dichiarata perche' e' il font a colori che si
+        // vuole (verificato installato), non un fallback qualunque scelto da
+        // Qt.
+        font.family: "Noto Color Emoji"
+        font.pixelSize: PetStyle.font.body
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        id: valueText
+        anchors.left: iconText.right
+        anchors.leftMargin: PetStyle.spacing.xs
+        anchors.verticalCenter: parent.verticalCenter
+        text: Math.round(cell.value)
+        // La soglia e' quella che aveva la barra: sotto 20 il colore d'allarme.
+        // Senza barra e' il numero a portarlo, o l'unica cosa che diceva
+        // «questa e' messa male» se ne andrebbe insieme al rettangolo.
+        color: cell.value <= 20 ? PetColor.urgent : PetColor.foreground
+        font.family: PetStyle.arcadeFamily
+        font.pixelSize: PetStyle.arcadeBody
       }
     }
   }

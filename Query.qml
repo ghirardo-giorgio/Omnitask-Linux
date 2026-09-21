@@ -53,42 +53,53 @@ Singleton {
         var payload;
 
         try {
-            switch (topic) {
-            case "capabilities":
-                payload = root.capabilities();
-                break;
-            case "overview":
-                payload = root.overview();
-                break;
-            case "connections":
-                payload = root.connections(query);
-                break;
-            case "top":
-                payload = root.top(query);
-                break;
-            case "process":
-                payload = root.process(query);
-                break;
-            case "home_assistant":
-                payload = root.homeAssistant(query);
-                break;
-            case "health":
-                payload = root.health();
-                break;
-            case "trend":
-                payload = root.trend(query);
-                break;
-            default:
-                return root.fail("unknown topic: " + (topic || "(none)"));
-            }
+            payload = root.build(query, topic);
         } catch (error) {
             return root.fail("failed to answer '" + topic + "': " + error);
         }
+
+        if (payload === null)
+            return root.fail("unknown topic: " + (topic || "(none)"));
 
         payload.topic = topic;
         payload.sampled_at = new Date().toISOString();
         payload.interval_ms = Settings.procInterval;
         return root.clamp(payload);
+    }
+
+    // The switch, kept apart from answer() because `bundle` needs a topic as
+    // an object rather than a string it has to parse back. `null` means the
+    // topic means nothing here — an error the caller words, since answer()
+    // and bundle() say it differently.
+    function build(query: var, topic: string): var {
+        switch (topic) {
+        case "capabilities":
+            return root.capabilities();
+        case "overview":
+            return root.overview();
+        case "connections":
+            return root.connections(query);
+        case "top":
+            return root.top(query);
+        case "process":
+            return root.process(query);
+        case "home_assistant":
+            return root.homeAssistant(query);
+        case "health":
+            return root.health();
+        case "trend":
+            return root.trend(query);
+        case "series":
+            return root.series(query);
+        case "bundle":
+            return root.bundle(query);
+        case "pet":
+            return root.pet();
+        case "pressure":
+            return root.pressureReport();
+        }
+
+        return null;
     }
 
     function fail(message: string): string {
@@ -471,9 +482,12 @@ Singleton {
 
         const domain = (query.domain || "").toLowerCase();
         const wanted = (query.query || "").toLowerCase();
+        // An explicit list wins over any filter: a client that already knows
+        // which entities it draws should not have to describe them.
+        const asked = Array.isArray(query.entities) ? query.entities : null;
 
         const all = Object.keys(HomeAssistant.states).sort();
-        const matched = all.filter(id => {
+        const matched = asked !== null ? all.filter(id => asked.includes(id)) : all.filter(id => {
             if (domain.length > 0 && id.split(".")[0] !== domain)
                 return false;
             if (wanted.length === 0)
@@ -502,7 +516,14 @@ Singleton {
                         unit: HomeAssistant.unit(id)
                     })),
             entities_matched: matched.length,
-            entities_shown: Math.min(matched.length, root.maxRows)
+            entities_shown: Math.min(matched.length, root.maxRows),
+            // The entities the user picked in the dashboard's own options,
+            // whether or not they were asked for here. A second screen
+            // showing this machine should show the same ones without the
+            // choice having to be made twice.
+            chosen: Settings.haEntities.slice(),
+            // Of those, the ones the user asked to see as a bare figure.
+            chosen_without_chart: Settings.haNoChart.slice()
         };
     }
 
@@ -780,10 +801,559 @@ Singleton {
         };
     }
 
+    // ------------------------------------------------------------- series
+
+    // The points themselves, not statistics about them. `trend` answers "is
+    // this growing?"; this one is what a client draws. It exists for a client
+    // that keeps a chart on screen — the phone app — which without the arrays
+    // would have to wait one sample at a time for a minute before its graph
+    // said anything.
+    //
+    // `metrics` is required and there is no "everything": every sensor and
+    // every disk at once goes past the 32 KiB ceiling, and whoever is drawing
+    // already knows what they are drawing.
+    function series(query: var): var {
+        const wanted = query.metrics ?? [];
+        if (!Array.isArray(wanted) || wanted.length === 0)
+            return {
+                ok: false,
+                error: "series needs a non-empty `metrics` array",
+                valid: root.seriesNames()
+            };
+
+        const out = ({});
+        const unknown = [];
+
+        for (const name of wanted) {
+            const found = root.seriesOf(String(name));
+            if (found === null) {
+                unknown.push(name);
+                continue;
+            }
+            out[name] = found;
+        }
+
+        return {
+            ok: true,
+            // Sampling period of the system series. `heart` and the Home
+            // Assistant ones carry their own, because they are not sampled by
+            // sysmon at all.
+            length: SystemStats.historyLength,
+            series: out,
+            unknown_metrics: unknown,
+            note: "History starts when the dashboard starts; it is not persisted across restarts."
+        };
+    }
+
+    // The fixed names. The three prefixed families are open-ended — one
+    // sensor, one disk and one Home Assistant entity each — so they are named
+    // by shape instead of being listed.
+    function seriesNames(): var {
+        return ["cpu", "memory", "gpu", "vram", "net_rx", "net_tx", "power_cpu", "power_gpu", "psi_cpu", "psi_io", "psi_mem", "freq", "heart", "temp:<sensor key>", "disk_read:<device>", "disk_write:<device>", "ha:<entity_id>"];
+    }
+
+    // One series, or null if the name means nothing here.
+    //
+    // `max` is the full-scale value the dashboard draws this series against,
+    // and it travels with the values because a client cannot work it out: a
+    // network chart is scaled against the busiest of download and upload
+    // together (see SystemStats.netScale), and a temperature against that
+    // sensor's own critical point rather than 100.
+    //
+    // `color` is whatever the user picked on the desktop
+    // (Settings.colorFor), so the same series is the same colour on both
+    // screens without the palette being written down twice.
+    function seriesOf(name: string): var {
+        const cut = name.indexOf(":");
+        const family = cut < 0 ? name : name.slice(0, cut);
+        const rest = cut < 0 ? "" : name.slice(cut + 1);
+
+        if (family === "temp") {
+            const history = (SystemStats.tempHistory ?? ({}))[rest];
+            if (history === undefined)
+                return null;
+            const sensor = SystemStats.sensor(rest);
+            return root.serie(history, "celsius", SystemStats.tempLimit(sensor), "temp:" + rest, "#f0883e");
+        }
+
+        if (family === "disk_read" || family === "disk_write") {
+            const history = (SystemStats.diskHistory ?? ({}))[rest];
+            if (history === undefined)
+                return null;
+            const read = family === "disk_read";
+            // Both directions share one full scale, or a quiet disk's writes
+            // would tower over its reads.
+            const scale = Math.max(1048576, ...(history.read ?? []), ...(history.write ?? []));
+            return root.serie(read ? history.read : history.write, "bytes_per_second", scale, read ? "diskRead" : "diskWrite", read ? "#58a6ff" : "#db6d28");
+        }
+
+        if (family === "ha") {
+            const history = (HomeAssistant.history ?? ({}))[rest];
+            if (history === undefined)
+                return null;
+            // Whatever the entity itself calls its unit: "%", "W", "°C". It
+            // is the entity's business, not ours, and without it a client has
+            // a line and no idea what it measures.
+            const state = (HomeAssistant.states ?? ({}))[rest];
+            const measure = state && state.attributes ? (state.attributes.unit_of_measurement ?? "") : "";
+            const serie = root.serie(history, measure, 0, "ha:" + rest, "#58a6ff");
+            // Home Assistant's own recorder, not sysmon's ring buffer: five
+            // minutes a point, and the window starts where the download did.
+            serie.interval_ms = HomeAssistant.historyBucketMinutes * 60000;
+            serie.starts_at = new Date(HomeAssistant.historyStart).toISOString();
+            serie.autoscale = true;
+            return serie;
+        }
+
+        const gpu = SystemStats.gpu;
+
+        switch (name) {
+        case "cpu":
+            return root.serie(SystemStats.cpuHistory, "percent", 100, "cpu", "#3fb950");
+        case "memory":
+            return root.serie(SystemStats.memHistory, "percent", 100, "ram", "#58a6ff");
+        case "gpu":
+            return gpu === null ? null : root.serie(SystemStats.gpuHistory, "percent", 100, "gpu", "#a371f7");
+        case "vram":
+            return gpu === null ? null : root.serie(SystemStats.vramHistory, "percent", 100, "vram", "#a371f7");
+        case "net_rx":
+            return root.serie(SystemStats.netRxHistory, "bytes_per_second", SystemStats.netScale, "netRx", "#58a6ff");
+        case "net_tx":
+            return root.serie(SystemStats.netTxHistory, "bytes_per_second", SystemStats.netScale, "netTx", "#db6d28");
+        case "power_cpu":
+        case "power_gpu":
+            // Watts have no ceiling to draw against, so the dashboard scales
+            // them against their own peak with a floor under it — otherwise
+            // an idle machine's two watts would fill the chart. See
+            // PowerChart.minScale, which is where the 60 comes from.
+            if (SystemStats.power === null)
+                return null;
+            const cpuSide = name === "power_cpu";
+            const watts = root.serie(cpuSide ? SystemStats.cpuWattHistory : SystemStats.gpuWattHistory, "watts", 0, cpuSide ? "powerCpu" : "powerGpu", cpuSide ? "#3fb950" : "#a371f7");
+            watts.autoscale = true;
+            watts.min_scale = 60;
+            return watts;
+        case "psi_cpu":
+            return root.serie(SystemStats.psiCpuHistory, "percent", 100, "psiCpu", "#3fb950");
+        case "psi_io":
+            return root.serie(SystemStats.psiIoHistory, "percent", 100, "psiIo", "#db6d28");
+        case "psi_mem":
+            return root.serie(SystemStats.psiMemHistory, "percent", 100, "psiMem", "#58a6ff");
+        case "freq":
+            return SystemStats.freq === null ? null : root.serie(SystemStats.freqHistory, "megahertz", SystemStats.freq.max ?? 0, "freq", "#58a6ff");
+        case "heart":
+            const beats = root.serie(Fitbit.values, "bpm", 0, "heart", "#f85149");
+            // One point a minute, and the gaps are real: nulls stay nulls so
+            // the line breaks where the band was off the wrist, instead of
+            // dropping to zero and drawing a cardiac arrest.
+            beats.interval_ms = 60000;
+            beats.gaps = true;
+            beats.autoscale = true;
+            return beats;
+        }
+
+        return null;
+    }
+
+    // Rounding is not cosmetic here: raw byte-per-second figures carry twelve
+    // digits of float noise each, and sixty of them per series is most of the
+    // reply spent on decimals nobody can see on a phone.
+    function serie(values: var, unit: string, max: real, colorId: string, fallback: string): var {
+        const rounded = (values ?? []).map(v => v === null || v === undefined || !isFinite(v) ? null : Math.round(v * 100) / 100);
+        return {
+            values: rounded,
+            unit: unit,
+            max: Math.round(max * 100) / 100,
+            color: Settings.colorFor(colorId, fallback)
+        };
+    }
+
+    // ------------------------------------------------------------- bundle
+
+    // Several topics in one reply.
+    //
+    // Every question costs the caller a process — `qs ipc call` is a fork —
+    // and a client refreshing six panels twice a second would spend more time
+    // starting processes than reading numbers. The answers are objects inside
+    // this one, which is why the switch lives in build() rather than inside
+    // answer(): going through JSON.stringify and parsing it back would be a
+    // string inside a string.
+    function bundle(query: var): var {
+        const requests = query.topics ?? [];
+        if (!Array.isArray(requests) || requests.length === 0)
+            return {
+                ok: false,
+                error: "bundle needs a non-empty `topics` array"
+            };
+
+        const answers = [];
+        const dropped = [];
+        // What clamp() would allow, less room for the envelope this all gets
+        // wrapped in. Dropping a topic and saying so beats tripping the cap
+        // and losing every answer in the batch.
+        var budget = root.maxResponseBytes - 1024;
+
+        for (const request of requests) {
+            const sub = (request || ({})).topic || "";
+
+            if (sub === "bundle") {
+                dropped.push({
+                    topic: sub,
+                    why: "a bundle cannot contain a bundle"
+                });
+                continue;
+            }
+
+            var payload;
+            try {
+                payload = root.build(request, sub);
+            } catch (error) {
+                payload = {
+                    ok: false,
+                    error: "failed to answer '" + sub + "': " + error
+                };
+            }
+
+            if (payload === null)
+                payload = {
+                    ok: false,
+                    error: "unknown topic: " + (sub || "(none)")
+                };
+
+            payload.topic = sub;
+            const cost = JSON.stringify(payload).length;
+
+            if (cost > budget) {
+                dropped.push({
+                    topic: sub,
+                    why: "no room left in the reply (" + cost + " bytes); ask for it on its own"
+                });
+                continue;
+            }
+
+            budget -= cost;
+            answers.push(payload);
+        }
+
+        return {
+            ok: true,
+            answers: answers,
+            dropped: dropped
+        };
+    }
+
     // ------------------------------------------------- home assistant act
 
     // The only path that changes anything. Kept apart from `answer` so no
     // read can ever mutate.
+    // ------------------------------------------------------------- pressure
+
+    // Why the machine is stalling, and whose fault it is.
+    //
+    // 🔴 The two halves are reported separately ON PURPOSE, because conflating
+    // them is the mistake this tool exists to prevent. Per-cgroup pressure
+    // measures how long a cgroup WAITED, so the top of that list is the
+    // desktop shell and the editor — the victims. Whoever took the memory
+    // first waits for nothing and looks innocent. `holders` is the other half:
+    // who has it.
+    //
+    // In `holders`, `shmem_bytes` is the number that decides whether a large
+    // cgroup is a problem: page cache is dropped for free when memory is
+    // needed, shared memory can only be swapped, one page at a time, while
+    // everything else waits.
+    function pressureReport(): var {
+        const psi = SystemStats.pressure;
+        const holders = (SystemStats.cgroups ?? []).map(c => ({
+                    name: c.comm && c.comm.length > 0 ? c.comm : c.name,
+                    unit: c.name,
+                    cgroup: c.path,
+                    memory_bytes: c.mem,
+                    // Not droppable: only swap can free it.
+                    shmem_bytes: c.shmem,
+                    // Droppable at no cost — a cgroup that is large only here
+                    // is not a problem.
+                    cache_bytes: c.cache,
+                    swap_bytes: c.swap,
+                    // 0 when no ceiling is set. A cgroup with a ceiling is one
+                    // somebody has already tried to contain.
+                    memory_high_bytes: c.high,
+                    waited_percent_60s: c.waited
+                }));
+
+        return {
+            ok: true,
+            // Percent of the last 60 seconds spent waiting. Over ~10% the
+            // machine is waiting more than it is working.
+            waiting: {
+                cpu: psi.cpu?.someAvg60 ?? null,
+                io: psi.io?.someAvg60 ?? null,
+                memory: psi.memory?.someAvg60 ?? null,
+                // `full` means nobody could make progress, not just someone.
+                io_full: psi.io?.fullAvg60 ?? null,
+                memory_full: psi.memory?.fullAvg60 ?? null
+            },
+            memory: {
+                total_bytes: SystemStats.mem.total,
+                used_bytes: SystemStats.mem.used,
+                swap_used_bytes: SystemStats.mem.swapUsed,
+                swap_total_bytes: SystemStats.mem.swapTotal,
+                // The two that say whether it is thrashing RIGHT NOW rather
+                // than merely full: bytes per second moving in and out of
+                // swap, and the page faults that had to reach the disk.
+                swap_in_bytes_per_s: SystemStats.mem.swapIn,
+                swap_out_bytes_per_s: SystemStats.mem.swapOut,
+                major_faults_per_s: SystemStats.mem.majFaults,
+                zram: SystemStats.mem.zram
+            },
+            holders: holders,
+            caveats: [
+                "holders is who HAS the memory; waited_percent_60s is who WAITED for it. They are usually different cgroups, and the second one is the victim.",
+                "shmem_bytes cannot be reclaimed, only swapped. A holder whose memory is mostly shmem is the one that stalls the machine.",
+                "An Electron application registers as 'app-org.chromium.Chromium-<pid>.scope'; read `name`, which is the actual command, before calling anything a browser."
+            ]
+        };
+    }
+
+    // ------------------------------------------------------------------ pet
+
+    // What the pet's traits are wired to right now, plus the two catalogues a
+    // caller needs in order to write one: the objects that can fall, and the
+    // measures a trait can watch.
+    //
+    // Why this is here at all: the traits are configured through a window with
+    // eight controls per row, and describing "an apple every 500 mAh of solar
+    // charge" out loud is faster than driving it. The window stays the place
+    // to fine-tune; this is the place to state the intent.
+    function pet(): var {
+        return {
+            ok: true,
+            traits: PetTraits.list.map(t => ({
+                        id: t.id,
+                        label: t.label,
+                        source: t.source,
+                        role: t.role,
+                        value: t.value,
+                        unit: t.unit,
+                        // Only one of the two shapes is meaningful per trait,
+                        // but both are reported: which one is in force is the
+                        // first thing a caller has to see to change it.
+                        drop: t.drop === null ? null : {
+                            when: t.drop.when,
+                            every: t.drop.every,
+                            threshold: t.drop.threshold,
+                            step: t.drop.step,
+                            hold_minutes: Math.round(t.drop.holdMs / 60000),
+                            cooldown_minutes: Math.round(t.drop.cooldownMs / 60000),
+                            item: t.drop.item.id,
+                            glyph: t.drop.item.glyph,
+                            kind: t.drop.item.kind,
+                            gift: t.drop.gift
+                        },
+                        wellness: t.wellness,
+                        effects: t.effects
+                    })),
+            items: PetTraits.dropItems.map(d => ({
+                        id: d.id,
+                        glyph: d.glyph,
+                        label: d.label,
+                        kind: d.kind,
+                        gift: d.gift
+                    })),
+            // Everything a trait may watch: the dashboard's own measures and
+            // every numeric Home Assistant entity. Capped, and the count says
+            // what was left out.
+            sources: root.petSources(),
+            sound: Settings.panelParam("pet", "sound", true) === true
+        };
+    }
+
+    function petSources(): var {
+        const out = [];
+        for (const s of PetTraits.systemSources) {
+            const source = "sys:" + s.key;
+            // The reading comes along, exactly as it does for the Home
+            // Assistant entities below: a caller choosing a step wants to know
+            // the scale it is stepping on, and for `adbPhones` the reading IS
+            // the answer to "is a phone attached right now" — null meaning
+            // nobody has looked yet, which is not the same as zero.
+            out.push({
+                source: source,
+                name: s.label,
+                unit: s.unit ?? "",
+                value: PetTraits.rawValue(source)
+            });
+        }
+
+        const ids = Object.keys(HomeAssistant.states).filter(id => id.startsWith("sensor."));
+        for (const id of ids.sort()) {
+            if (out.length >= root.maxRows * 3)
+                break;
+            const st = HomeAssistant.states[id];
+            const n = parseFloat(st.state);
+            // A switch that reads on/off has no range and cannot drive a
+            // trait: offering it would only produce a trait that never fires.
+            if (!isFinite(n))
+                continue;
+            out.push({
+                source: "ha:" + id,
+                name: (st.attributes && st.attributes.friendly_name) || id,
+                unit: (st.attributes && st.attributes.unit_of_measurement) || "",
+                value: n
+            });
+        }
+        return out;
+    }
+
+    // The pet's write entry point. Separate from `act` — which only ever
+    // touches Home Assistant — for the same reason `act` is separate from
+    // `answer`: one door per thing that can change.
+    //
+    // 🔴 It goes through PetTraits rather than writing pet-traits.json from
+    // Python, and that is the whole design. The catalogue of objects, the
+    // defaults for a new trait, the gift each object carries and the id
+    // allocation all live there; a second copy in the MCP server would be two
+    // tables to keep in step, and the first one to drift would do it silently.
+    function petAct(request: string): string {
+        var command;
+        try {
+            command = JSON.parse(request || "{}");
+        } catch (error) {
+            return root.fail("request is not valid JSON: " + error);
+        }
+
+        const action = command.action || "";
+
+        if (action === "remove") {
+            const id = command.id || "";
+            if (!PetTraits.traits.some(t => t.id === id))
+                return root.fail("unknown trait: " + (id || "(none)"));
+            PetTraits.remove(id);
+            return JSON.stringify({ ok: true, action: "remove", id: id });
+        }
+
+        if (action !== "set")
+            return root.fail("unknown action: " + (action || "(none)") + " (use 'set' or 'remove')");
+
+        // Either an existing trait to amend, or a source to build a new one on.
+        const existing = command.id ? PetTraits.traits.find(t => t.id === command.id) : null;
+        if (command.id && !existing)
+            return root.fail("unknown trait: " + command.id);
+
+        const source = command.source || (existing ? existing.source : "");
+        if (!source)
+            return root.fail("source is required (e.g. 'ha:sensor.solare_usb_carica' or 'sys:cpu')");
+        if (!source.startsWith("ha:") && !source.startsWith("sys:"))
+            return root.fail("source must start with 'ha:' or 'sys:'");
+
+        const reading = PetTraits.rawValue(source);
+        if (reading === null && !existing)
+            return root.fail("that source reads nothing right now: " + source
+                             + " (check the entity id; a trait on a source that never answers never fires)");
+
+        // A new trait starts from the same defaults the window would give it,
+        // so a caller that names only a source and a step still gets a
+        // complete, working row.
+        var trait;
+        if (existing) {
+            trait = JSON.parse(JSON.stringify(existing));
+        } else {
+            trait = PetTraits.defaultsFor(source, reading ?? 0, command.role === "wellness" ? "wellness" : "drop");
+            trait.id = PetTraits.freeId(PetTraits.idFor(source));
+            trait.source = source;
+        }
+
+        if (command.source)
+            trait.source = command.source;
+        if (typeof command.label === "string" && command.label.trim().length > 0)
+            trait.label = command.label.trim().slice(0, 40);
+        if (command.role === "wellness" || command.role === "drop")
+            trait.role = command.role;
+
+        if (trait.role === "drop") {
+            const when = command.when || "";
+            if (when) {
+                if (["above", "below", "rise", "fall"].indexOf(when) < 0)
+                    return root.fail("when must be one of: above, below, rise, fall");
+                trait.dropWhen = when;
+            }
+            if (typeof command.step === "number" && isFinite(command.step)) {
+                if (command.step <= 0)
+                    return root.fail("step must be greater than zero");
+                trait.step = command.step;
+            }
+            if (typeof command.threshold === "number" && isFinite(command.threshold))
+                trait.threshold = command.threshold;
+            if (typeof command.hold_minutes === "number" && isFinite(command.hold_minutes))
+                trait.holdMinutes = Math.max(0, command.hold_minutes);
+            if (typeof command.cooldown_minutes === "number" && isFinite(command.cooldown_minutes))
+                trait.cooldownMinutes = Math.max(0, command.cooldown_minutes);
+
+            if (typeof command.item === "string" && command.item.length > 0) {
+                // Either a catalogue id, or an emoji nobody has used yet — in
+                // which case it joins the catalogue the same way the window's
+                // "+ emoji" button adds one.
+                const known = PetTraits.dropItems.find(d => d.id === command.item);
+                if (known) {
+                    trait.item = known.id;
+                    trait.gift = known.gift;
+                } else {
+                    const made = PetTraits.addDropItem(command.item, command.item_label || "",
+                                                       command.kind === "malus" ? "malus" : "bonus");
+                    if (made === "")
+                        return root.fail("item is neither a catalogue id nor a usable emoji: " + command.item);
+                    trait.item = made;
+                    trait.gift = PetTraits.dropItemById(made).gift;
+                }
+            }
+
+            // The gift is merged onto whatever the object carries, so naming
+            // one stat does not silently zero the other three.
+            if (command.gift && typeof command.gift === "object") {
+                const base = PetTraits.giftOf(trait);
+                const gift = {
+                    hunger: base.hunger,
+                    energy: base.energy,
+                    happiness: base.happiness,
+                    hygiene: base.hygiene
+                };
+                for (const key of ["hunger", "energy", "happiness", "hygiene"]) {
+                    const v = command.gift[key];
+                    if (typeof v === "number" && isFinite(v))
+                        gift[key] = Math.max(-100, Math.min(100, v));
+                }
+                trait.gift = gift;
+            }
+        }
+
+        PetTraits.upsert(trait);
+
+        const live = PetTraits.list.find(t => t.id === trait.id) ?? null;
+        return JSON.stringify({
+            ok: true,
+            action: "set",
+            id: trait.id,
+            trait: live === null ? trait : {
+                id: live.id,
+                label: live.label,
+                source: live.source,
+                role: live.role,
+                value: live.value,
+                unit: live.unit,
+                drop: live.drop === null ? null : {
+                    when: live.drop.when,
+                    every: live.drop.every,
+                    threshold: live.drop.threshold,
+                    step: live.drop.step,
+                    item: live.drop.item.id,
+                    glyph: live.drop.item.glyph,
+                    kind: live.drop.item.kind,
+                    gift: live.drop.gift
+                }
+            },
+            note: "Saved to ~/.config/quickshell/pet-traits.json; the running panel picked it up already."
+        });
+    }
+
     function act(request: string): string {
         var command;
         try {

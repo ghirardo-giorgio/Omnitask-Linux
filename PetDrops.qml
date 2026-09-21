@@ -91,6 +91,12 @@ Item {
             // dopo lo raccoglierebbe una seconda volta.
             it.taken = true;
             it.life.stop();
+            // Il suono della raccolta parte QUI e non da chi riceve il
+            // segnale: e' l'istante in cui la cosa e' successa, e passarlo di
+            // mano vorrebbe dire un suono in ritardo di un giro su un gesto
+            // che dura un fotogramma. Se i suoni sono spenti, play() non fa
+            // niente — la guardia sta dentro PetSfx, una volta sola.
+            PetSfx.play("catch");
             field.caught(it.key);
             return;
         }
@@ -185,7 +191,10 @@ Item {
                 }
 
                 ScriptAction {
-                    script: drop.onGround = true
+                    script: {
+                        drop.onGround = true;
+                        PetSfx.play("land");
+                    }
                 }
 
                 PauseAnimation {

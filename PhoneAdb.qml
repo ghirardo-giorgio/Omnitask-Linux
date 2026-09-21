@@ -121,6 +121,53 @@ Singleton {
     // stato" vuol dire "non lo so ancora", che non e' "non collegato".
     property bool linksKnown: false
 
+    // Quanti telefoni adb vede ADESSO. Zero e' un numero, «non lo so ancora»
+    // e' `linksKnown` falso: chi conta deve poterli distinguere, o al primo
+    // avvio un pet festeggerebbe la connessione di un telefono che era gia'
+    // collegato da un'ora.
+    readonly property int connectedCount: {
+        var n = 0;
+        for (const name of root.phones) {
+            const link = root.links[name];
+            if (link && link.connected)
+                n++;
+        }
+        return n;
+    }
+
+    // ---- Chi vuole il pallino anche a pannello chiuso ----------------------
+    //
+    // `peek()` costa un `adb devices` — 350 ms, niente mDNS — e finora lo
+    // chiedeva solo chi lo stava guardando: il pannello Telefoni e la finestra
+    // Opzioni, ognuno col suo timer. Una caratteristica del pet cablata su
+    // `sys:adbPhones` ha lo stesso bisogno senza avere una finestra aperta.
+    //
+    // 🔴 Contatore e non booleano, ed e' la regola di casa di
+    // `HomeAssistant.watchHistory()`: due pannelli che chiedono la stessa cosa
+    // e uno che chiude non devono poter spegnere l'altro.
+    property int peekWatchers: 0
+
+    function watchPeek(): void {
+        root.peekWatchers++;
+        // Subito, non fra trenta secondi: chi accende una caratteristica vuole
+        // vedere se ha funzionato adesso.
+        root.peek();
+    }
+
+    function unwatchPeek(): void {
+        root.peekWatchers = Math.max(0, root.peekWatchers - 1);
+    }
+
+    // Lo stesso ritmo del pannello Telefoni, e per la stessa ragione scritta
+    // la': un collegamento che cade non lo annuncia nessuno, e trenta secondi
+    // di ritardo non si notano. Spento quando nessuno guarda.
+    Timer {
+        interval: KdeConnect.pollInterval
+        running: root.peekWatchers > 0
+        repeat: true
+        onTriggered: root.peek()
+    }
+
     // Il telefono che il pannello sta collegando adesso, "" quando nessuno.
     // Il nome e non un `busy`: nel pannello le icone sono una per telefono, e
     // un booleano solo le farebbe girare tutte insieme.

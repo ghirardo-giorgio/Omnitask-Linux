@@ -101,6 +101,16 @@ Singleton {
 
     property var pressure: ({})
 
+    // 🔴 Chi la memoria ce l'ha, che e' una domanda DIVERSA da `pressure`.
+    // Quella dice quanto si e' aspettato; la pressione per cgroup, che si
+    // potrebbe leggere allo stesso modo, dice quanto ha aspettato ognuno — e
+    // in cima ci finiscono le vittime, non i colpevoli, perche' chi si prende
+    // la memoria per primo non aspetta niente. Questa e' l'altra meta': i
+    // cgroup piu' grossi, gia' scelti fra i piu' specifici, con la parte di
+    // memoria che il kernel NON puo' buttare via (`shmem`) separata dalla
+    // cache. Vedi compute_cgroups() in scripts/sysmon.py.
+    property var cgroups: []
+
     property var psiCpuHistory: []
     property var psiIoHistory: []
     property var psiIoFullHistory: []
@@ -128,6 +138,33 @@ Singleton {
 
     property var cpuWattHistory: []
     property var gpuWattHistory: []
+
+    // Energia accumulata da quando la macchina e' accesa, contata da
+    // scripts/sysmon.py — che e' l'unico posto dove si puo' contare, perche'
+    // un integrale non si ricostruisce dopo e la dashboard si riapre.
+    //
+    // {
+    //     cpuWh, gpuWh,     wattora misurati (CPU dal contatore RAPL,
+    //                       GPU per rettangoli sulla potenza istantanea)
+    //     seconds,          secondi davvero misurati: MENO dell'uptime se la
+    //                       dashboard e' stata aperta a sessione avviata o se
+    //                       la macchina ha dormito
+    //     bootAt,           orologio dell'accensione
+    //     startedAt,        orologio del primo campione misurato
+    //     now,              orologio dell'ultimo campione
+    //     hours: [ { h, wh, s } ]   fasce orarie, h = inizio ora locale
+    // }
+    //
+    // Vuoto finche' non arriva il primo campione.
+    property var energy: ({
+        cpuWh: 0,
+        gpuWh: 0,
+        seconds: 0,
+        bootAt: 0,
+        startedAt: 0,
+        now: 0,
+        hours: []
+    })
 
     // ========================================================= storico generale
 
@@ -445,6 +482,9 @@ Singleton {
                 root.pressure =
                     d.pressure ?? ({});
 
+                root.cgroups =
+                    d.cgroups ?? [];
+
                 // ================================================= health
 
                 root.health =
@@ -492,6 +532,9 @@ Singleton {
                             d.power.gpu ?? 0
                         );
                 }
+
+                if (d.energy)
+                    root.energy = d.energy;
 
                 // ================================================= dischi
 

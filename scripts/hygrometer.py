@@ -20,6 +20,12 @@ E' lo stesso mestiere di solar_meter.py, e ne segue la strada: un JSON su
 stdout, il sensore creato al volo con /api/states, il timer che lo chiama ogni
 dieci minuti.
 
+Quale webcam guardare non e' scritto qui: lo sceglie il pannello e lo salva
+nei panelParams della dashboard, che e' l'unico posto che vedono tutti e due —
+il pannello quando si preme Leggi, e il timer di systemd, che nessuno avvia a
+mano. Con --cameras si ottiene l'elenco di quelle attaccate, che e' quello che
+il pannello mette nella tendina.
+
 Va avviato con l'interprete del venv dell'Igrometro, l'unico che ha OpenCV:
 
     ~/Documents/Development/Python/Igrometer/.venv/bin/python hygrometer.py
@@ -33,9 +39,11 @@ Codici d'uscita, come per il tester solare:
 import argparse
 import contextlib
 import datetime
+import fcntl
 import importlib.util
 import json
 import os
+import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -50,6 +58,94 @@ ENTITY = "sensor.igrometro_umidita"
 OK = 0
 GUASTO = 1
 NIENTE = 2
+
+# La configurazione della dashboard: e' li' che il pannello scrive quale webcam
+# guarda l'igrometro, e da li' la prende anche il timer di systemd, che il
+# pannello non lo avvia lui.
+CONFIG = os.path.expanduser("~/.config/quickshell/dashboard.json")
+
+# VIDIOC_QUERYCAP, la domanda che si fa a un nodo /dev/videoN per sapere chi e'
+# — il numero e' quello che uscirebbe da _IOR('V', 0, struct v4l2_capability).
+# Serve perche' i nodi non sono le webcam: una sola telecamera ne accende due o
+# tre (l'immagine, i metadati), e solo il primo si puo' aprire per guardarci
+# dentro. Elencarli tutti vorrebbe dire offrire tre voci per una webcam sola,
+# due delle quali non funzionano.
+QUERYCAP = 0x80685600
+QUERYCAP_FMT = "16s32s32sIII3I"
+CAP_VIDEO_CAPTURE = 0x00000001
+CAP_DEVICE_CAPS = 0x80000000
+
+
+def descrivi(nodo):
+    """Nome e mestiere di un nodo /dev/videoN, o None se non e' una webcam."""
+    try:
+        fd = os.open(nodo, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+
+    try:
+        risposta = fcntl.ioctl(fd, QUERYCAP, b"\0" * struct.calcsize(QUERYCAP_FMT))
+    except OSError:
+        # Non parla v4l2, o non ci lascia chiedere: non e' roba da igrometro.
+        return None
+    finally:
+        os.close(fd)
+
+    campi = struct.unpack(QUERYCAP_FMT, risposta)
+    scheda, capacita, del_nodo = campi[1], campi[4], campi[5]
+
+    # device_caps dice cosa fa *questo* nodo, capabilities cosa fa l'apparecchio
+    # intero: sui driver vecchi il primo non c'e', e allora vale il secondo.
+    proprie = del_nodo if capacita & CAP_DEVICE_CAPS else capacita
+
+    if not proprie & CAP_VIDEO_CAPTURE:
+        return None
+
+    return scheda.split(b"\0")[0].decode("utf-8", "replace").strip()
+
+
+def elenca_webcam():
+    """Le webcam attaccate, come le vede OpenCV: indice, nome, nodo.
+
+    L'indice e' quello del nodo (/dev/video2 -> 2), che e' anche il numero che
+    vuole cv2.VideoCapture: gli altri modi di contarle — la posizione
+    nell'elenco, l'ordine di collegamento — cambiano quando se ne stacca una, e
+    la scelta salvata punterebbe a un'altra telecamera.
+    """
+    trovate = []
+
+    for nome in os.listdir("/dev"):
+        if not nome.startswith("video") or not nome[5:].isdigit():
+            continue
+
+        nodo = "/dev/" + nome
+        scheda = descrivi(nodo)
+
+        if scheda is None:
+            continue
+
+        trovate.append({"indice": int(nome[5:]), "nome": scheda or nodo, "nodo": nodo})
+
+    return sorted(trovate, key=lambda w: w["indice"])
+
+
+def camera_scelta():
+    """La webcam scelta dal pannello, o la prima per chi non ha mai scelto.
+
+    Il numero sta nei panelParams della dashboard e non in un file di questo
+    script: e' il pannello a farlo scegliere, e due posti dove scriverlo
+    vorrebbero dire due posti che possono dire cose diverse.
+    """
+    try:
+        with open(CONFIG, encoding="utf-8") as handle:
+            scelta = json.load(handle)["panelParams"]["igrometro"]["camera"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
+
+    try:
+        return int(scelta)
+    except (TypeError, ValueError):
+        return 0
 
 
 # Lo stdout vero, tenuto da parte prima di ogni dirottamento: mentre parla il
@@ -116,6 +212,46 @@ def open_camera(cv2, index):
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     return cap
+
+
+def inservibile(cv2, frame):
+    """Perche' in questo fotogramma non c'e' niente da leggere, o None se c'e'.
+
+    Prima si andava dritti a cercare la lancetta, e qualunque cosa andasse
+    storta usciva come «lancetta non rilevata»: che manda a controllare
+    l'inquadratura anche quando l'inquadratura non c'entra niente. Il 02/09/2026
+    la webcam ha consegnato per tre ore fotogrammi bianchi *uniformi* — min 255,
+    max 255, identici a posa 1 e guadagno 0, e uguali fuori da OpenCV con
+    ffmpeg: non e' una scena, e' un buffer che il driver non ha mai riempito,
+    perche' l'USB della C270 si stava resettando ogni pochi minuti
+    («error -71» nel journal). Nessuna calibrazione rimedia a quello, e il
+    messaggio deve mandare a guardare il cavo, non il quadrante.
+
+    Le tre risposte, in ordine di quanto sono lontane dal quadrante: niente
+    immagine, immagine piatta, immagine dove il quadrante non si distingue.
+    """
+    if frame is None:
+        return "la webcam non consegna fotogrammi: guarda il collegamento"
+
+    grigio = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    minimo, massimo, media = int(grigio.min()), int(grigio.max()), float(grigio.mean())
+
+    # Un'immagine vera ha sempre un po' di rumore: quattro livelli fra il punto
+    # piu' scuro e il piu' chiaro non li fa nemmeno un muro bianco.
+    if massimo - minimo < 4:
+        return (f"la webcam consegna un fotogramma vuoto (tutto a {minimo}): "
+                f"flusso USB interrotto, guarda il cavo o la porta")
+
+    # Qui invece l'immagine c'e' ma il quadrante ci si perde dentro. Le soglie
+    # sono larghe apposta: servono a distinguere «non si vede» da «non trovo la
+    # lancetta», non a giudicare una fotografia.
+    if media > 245:
+        return "immagine bruciata dalla luce: sposta la lampada o la telecamera"
+
+    if media < 20:
+        return "troppo buio per vedere il quadrante"
+
+    return None
 
 
 def fuori_scala(angle, taratura):
@@ -196,7 +332,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dir", default=IGROMETRO,
                         help="cartella del programma dell'igrometro")
-    parser.add_argument("--camera", type=int, default=0, help="indice della webcam")
+    parser.add_argument("--camera", type=int, default=None,
+                        help="indice della webcam (senza, quella scelta nel pannello)")
+    parser.add_argument("--cameras", action="store_true",
+                        help="elenca le webcam attaccate ed esci, senza guardare niente")
     parser.add_argument("--samples", type=int, default=3,
                         help="frame per misura, di cui si prende la mediana")
     parser.add_argument("--dry-run", action="store_true",
@@ -204,6 +343,14 @@ def main():
     parser.add_argument("--no-log", action="store_true",
                         help="non aggiungere la riga al CSV dello strumento")
     args = parser.parse_args()
+
+    # L'elenco delle webcam non ha bisogno ne' della calibrazione ne' di
+    # OpenCV: e' la domanda che si fa *prima* di poter guardare, e deve
+    # rispondere anche quando tutto il resto e' ancora da mettere a posto.
+    if args.cameras:
+        emit({"ok": True, "webcam": elenca_webcam()}, OK)
+
+    camera = camera_scelta() if args.camera is None else args.camera
 
     directory = os.path.expanduser(args.dir)
 
@@ -228,7 +375,18 @@ def main():
                  NIENTE)
 
         taratura = strumento.calibration
-        cap = open_camera(strumento.cv2, args.camera)
+        cap = open_camera(strumento.cv2, camera)
+
+        # Un fotogramma di prova prima della misura: costa un frame e distingue
+        # i guasti che con la lancetta non c'entrano.
+        motivo = inservibile(strumento.cv2, strumento.grab_fresh_frame(cap))
+
+        if motivo:
+            cap.release()
+            emit({"ok": False,
+                  "quando": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "error": motivo},
+                 NIENTE)
 
         try:
             misura = strumento.take_measurement(

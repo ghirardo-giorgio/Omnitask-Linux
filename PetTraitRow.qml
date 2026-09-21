@@ -77,13 +77,34 @@ Rectangle {
     }
 
     readonly property real threshold: typeof row.trait.threshold === "number" && isFinite(row.trait.threshold) ? row.trait.threshold : 0
-    readonly property bool dropBelow: row.trait.dropWhen === "below"
+
+    // Il modo in cui questa caratteristica fa cadere le cose. Quattro valori e
+    // non due: "above"/"below" guardano dove sta il valore, "rise"/"fall"
+    // quanto si e' mosso. Il ripiego e' "above" per la stessa ragione di
+    // PetTraits — un file scritto a mano con una parola sbagliata deve fare la
+    // cosa piu' comune, non niente.
+    readonly property string dropMode: row.trait.dropWhen === "below"
+                                       || row.trait.dropWhen === "rise"
+                                       || row.trait.dropWhen === "fall" ? row.trait.dropWhen : "above"
+    readonly property bool dropBelow: row.dropMode === "below"
+    readonly property bool dropEvery: row.dropMode === "rise" || row.dropMode === "fall"
+
+    // Il passo: ogni quante unita' del sensore cade un oggetto. Stesso ripiego
+    // di PetTraits, e vale la pena che sia lo stesso: la riga mostra il numero
+    // che la meccanica usera' davvero anche prima che qualcuno lo scriva.
+    readonly property real dropStep: typeof row.trait.step === "number" && isFinite(row.trait.step) && row.trait.step > 0
+                                     ? row.trait.step
+                                     : PetTraits.defaultStep(row.trait.min ?? 0, row.trait.max ?? 100)
 
     // Se adesso la condizione e' vera. E' il riscontro che dice se la soglia
     // e' quella giusta: senza, si salva e si aspetta cinque minuti per
     // scoprire che il verso era al contrario.
+    //
+    // ⚠️ Nullo per le caratteristiche a passo: li' non c'e' nessuna condizione
+    // vera o falsa da mostrare — c'e' una distanza che si accumula, e quella
+    // la tiene il pannello, non questa finestra.
     readonly property var dropNow: {
-        if (!row.isDrop || !row.live || row.live.value === null)
+        if (!row.isDrop || row.dropEvery || !row.live || row.live.value === null)
             return null;
         return row.dropBelow ? row.live.value < row.threshold : row.live.value > row.threshold;
     }
@@ -442,7 +463,9 @@ Rectangle {
                     color: "#6e7681"
                     font.pixelSize: 10
                     textFormat: Text.PlainText
-                    text: `${row.dropItem.glyph} ${row.dropBelow ? I18n.t("sotto") : I18n.t("sopra")} ${PetTraits.pretty(row.threshold)}`
+                    text: row.dropEvery
+                          ? `${row.dropItem.glyph} ${row.dropMode === "fall" ? I18n.t("cala di") : I18n.t("sale di")} ${PetTraits.pretty(row.dropStep)}`
+                          : `${row.dropItem.glyph} ${row.dropBelow ? I18n.t("sotto") : I18n.t("sopra")} ${PetTraits.pretty(row.threshold)}`
                 }
             }
         }
@@ -493,19 +516,36 @@ Rectangle {
                 Text {
                     color: "#6e7681"
                     font.pixelSize: 10
-                    text: I18n.t("cade se il valore resta")
+                    text: I18n.t("cade quando il valore")
                 }
 
+                // I primi due modi guardano DOVE sta il valore e vogliono che
+                // ci resti; gli altri due quanto si e' MOSSO, e cadono ogni
+                // passo percorso. Una batteria che si carica passa da 20 a 80
+                // una volta sola: «resta sopra 50» vale un oggetto per
+                // ricarica, «sale di 500» ne vale uno ogni 500.
                 Chip {
-                    label: I18n.t("sopra")
-                    current: !row.dropBelow
+                    label: I18n.t("resta sopra")
+                    current: row.dropMode === "above"
                     onChosen: row.set("dropWhen", "above")
                 }
 
                 Chip {
-                    label: I18n.t("sotto")
+                    label: I18n.t("resta sotto")
                     current: row.dropBelow
                     onChosen: row.set("dropWhen", "below")
+                }
+
+                Chip {
+                    label: I18n.t("sale di")
+                    current: row.dropMode === "rise"
+                    onChosen: row.set("dropWhen", "rise")
+                }
+
+                Chip {
+                    label: I18n.t("cala di")
+                    current: row.dropMode === "fall"
+                    onChosen: row.set("dropWhen", "fall")
                 }
 
                 Item {
@@ -522,6 +562,12 @@ Rectangle {
                     text: {
                         if (!row.live || row.live.value === null)
                             return I18n.t("adesso non si sa");
+                        // A passo non c'e' una condizione da dire vera o falsa:
+                        // si mostra il valore e basta, che e' comunque il
+                        // riscontro che serve — dice su quale scala si sta
+                        // scegliendo il passo.
+                        if (row.dropEvery)
+                            return I18n.t("adesso %1").arg(row.live.text);
                         return row.dropNow ? I18n.t("adesso %1: la condizione è vera").arg(row.live.text) : I18n.t("adesso %1: la condizione è falsa").arg(row.live.text);
                     }
                 }
@@ -531,16 +577,29 @@ Rectangle {
                 Layout.fillWidth: true
                 spacing: 8
 
+                // I due campi della soglia e il passo si escludono: sono le
+                // due meccaniche, e mostrarli tutti insieme vorrebbe dire tre
+                // numeri di cui due non fanno niente — senza niente che dica
+                // quali.
                 Num {
+                    visible: !row.dropEvery
                     label: I18n.t("soglia")
                     value: row.threshold
                     onEdited: v => row.set("threshold", v)
                 }
 
                 Num {
+                    visible: !row.dropEvery
                     label: I18n.t("per (minuti)")
                     value: row.trait.holdMinutes ?? 5
                     onEdited: v => row.set("holdMinutes", v)
+                }
+
+                Num {
+                    visible: row.dropEvery
+                    label: I18n.t("ogni")
+                    value: row.dropStep
+                    onEdited: v => row.set("step", v)
                 }
 
                 Num {
@@ -592,7 +651,11 @@ Rectangle {
 
                             Tooltip {
                                 hovered: parent.hovered
-                                text: modelData.hint.length > 0 ? modelData.hint : I18n.t("aggiunta da te")
+                                // ⚠️ `hint` esiste solo sugli oggetti di serie: quelli
+                                // aggiunti con «+ emoji» non ce l'hanno affatto, e
+                                // `undefined.length` e' un TypeError a ogni disegno del
+                                // chip — visibile solo nel log, con la finestra aperta.
+                                text: (modelData.hint ?? "").length > 0 ? modelData.hint : I18n.t("aggiunta da te")
                             }
                         }
                     }
@@ -642,7 +705,11 @@ Rectangle {
 
                             Tooltip {
                                 hovered: parent.hovered
-                                text: modelData.hint.length > 0 ? modelData.hint : I18n.t("aggiunta da te")
+                                // ⚠️ `hint` esiste solo sugli oggetti di serie: quelli
+                                // aggiunti con «+ emoji» non ce l'hanno affatto, e
+                                // `undefined.length` e' un TypeError a ogni disegno del
+                                // chip — visibile solo nel log, con la finestra aperta.
+                                text: (modelData.hint ?? "").length > 0 ? modelData.hint : I18n.t("aggiunta da te")
                             }
                         }
                     }

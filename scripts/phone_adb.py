@@ -2602,7 +2602,15 @@ HEALTH_SERVICE = "_healthbridge._tcp"
 # TXT di mDNS e la ripete in /api/ping: se un giorno non combaciano, e' cambiata
 # la forma delle risposte e va riletto il README invece di indovinare quale
 # chiave sia sparita.
-HEALTH_API = 1
+#
+# 2 da quando l'app e' diventata bilingue: le fasi del sonno in `today.sleep.
+# stages` sono passate alle chiavi inglesi — `deep`, `rem`, `light`, `awake`,
+# `other` dove prima erano `profondo`, `rem`, `leggero`, `sveglio`, `altro` — e
+# con loro tutta la prosa delle risposte, che ora e' in inglese perche' non
+# cambi con la lingua di chi chiama. Le chiavi che questo file legge non sono
+# cambiate; quello che arriva in `error` invece si', ed e' inglese anche in una
+# dashboard italiana.
+HEALTH_API = 2
 
 # Due file e non uno, perche' sono due cose diverse. La chiave e'
 # configurazione: si registra a mano una volta, e se sparisce va riscritta.
@@ -2621,14 +2629,15 @@ HEALTH_CACHE = os.path.join(
 )
 
 HEALTH_NO_TOKEN = (
-    "manca la chiave di HealthBridge. Aprila sul telefono, leggi la chiave "
-    "sotto l'indirizzo (o dal QR), poi: `phone_adb.py health-pair LA_CHIAVE`"
+    "manca la chiave di HealthBridge. Aprila sul telefono: sotto l'indirizzo "
+    "c'e' il collegamento intero, e la chiave e' quello che segue `?t=` (la "
+    "stessa che sta nel QR). Poi: `phone_adb.py health-pair LA_CHIAVE`"
 )
 
 HEALTH_NOT_FOUND = (
     "nessun HealthBridge sulla rete. Aprila sul telefono e premi «Avvia il "
-    "server»; se e' gia' acceso, controlla che telefono e PC siano sulla "
-    "stessa rete WiFi"
+    "server» («Start the server» se il telefono e' in inglese); se e' gia' "
+    "acceso, controlla che telefono e PC siano sulla stessa rete WiFi"
 )
 
 HEALTH_OTHER_NAME = (
@@ -2672,7 +2681,7 @@ HEALTH_DENIED = (
 HEALTH_SLOW = (
     "«%s» risponde ma la lettura non e' finita entro %d secondi. Succede quando "
     "Android ha messo l'app a dormire: aprila sul telefono e premi «Escludi "
-    "dall'ottimizzazione» in fondo alla schermata"
+    "dall'ottimizzazione» («Exclude from optimisation») in fondo alla schermata"
 )
 
 HEALTH_GRINDING = (
@@ -2839,6 +2848,41 @@ def health_asleep():
     return "HealthBridge dorme fino alle %s (fascia %s-%s)" % (end, start, end) if quiet else ""
 
 
+# Le frasi che l'app manda al posto di un dato, ridette in italiano.
+#
+# L'API di HealthBridge parla inglese di proposito, cosi' un errore non cambia
+# con la lingua di chi chiede — ed e' anche cio' che rende questa tabella
+# possibile: si aggancia a un testo che non si muove, invece che alla
+# traduzione di un altro progetto. Quello che non e' qui dentro passa com'e':
+# meglio una frase in inglese di un errore inghiottito.
+HEALTH_SAID = (
+    ("Health Connect is not available",
+     "Health Connect non e' disponibile su questo telefono"),
+    ("Health Connect is installed but needs an update",
+     "Health Connect e' installato ma va aggiornato"),
+    ("a read is already running",
+     "una lettura e' gia' in corso sul telefono, riprova fra poco"),
+    ("Health Connect did not answer",
+     "Health Connect non ha finito la lettura: succede quando Android ha messo "
+     "l'app a dormire"),
+    ("nothing here",
+     "questa rotta non c'e': l'app sul telefono e' piu' vecchia di questo "
+     "script, aggiornala"),
+    ("unknown command",
+     "comando che l'app non conosce: l'app sul telefono e' piu' vecchia di "
+     "questo script, aggiornala"),
+)
+
+
+def health_say(err):
+    """La frase del telefono in italiano, se e' una di quelle che conosciamo."""
+    for english, italian in HEALTH_SAID:
+        if english in (err or ""):
+            return italian
+
+    return err
+
+
 def health_trouble(err):
     """L'errore pronto da mostrare, con dentro cosa serve per rimediare.
 
@@ -2928,7 +2972,7 @@ def health_ask(action, params=None, target="", timeout=150):
         if data is not None:
             health_remember(host, port)
             return (data, "") if data.get("state") == "ok" else (
-                None, data.get("error") or "la lettura e' fallita"
+                None, health_say(data.get("error")) or "la lettura e' fallita"
             )
 
         if code == 403:
@@ -2937,7 +2981,7 @@ def health_ask(action, params=None, target="", timeout=150):
         # Un errore che non e' di raggiungibilita' non migliora cambiando
         # indirizzo: il telefono ha risposto, e ha risposto cosi'.
         if code:
-            return None, why or "il telefono ha risposto %d" % code
+            return None, health_say(why) or "il telefono ha risposto %d" % code
 
         # Scaduto il tempo: il telefono e' li' ma sta ancora leggendo. Diverso
         # da una porta chiusa, e vale la pena tenerlo da parte per il caso in

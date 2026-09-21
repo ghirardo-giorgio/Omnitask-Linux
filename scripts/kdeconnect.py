@@ -29,6 +29,20 @@ deve poter cambiare niente per sbaglio. Il server MCP infatti chiama solo la
 lettura — la clipboard e' roba che si spinge premendo un pulsante, non
 rispondendo a una domanda.
 
+Mandare non passa per il plugin clipboard di kdeconnectd: il suo
+`sendClipboard` non prende argomenti, manda la copia che il demone si tiene in
+RAM, e su questa sessione quella copia e' quasi sempre vuota. Il plugin legge
+con `KSystemClipboard`, che su Wayland vuole `zwlr_data_control_manager_v1` o
+`ext_data_control_manager_v1`; mutter 50 non pubblica ne' l'uno ne' l'altro, e
+il ripiego su `QClipboard` non vede niente perche' il compositor consegna la
+selection solo al client con il focus da tastiera — e un demone finestre non ne
+ha. Misurato il 2026-09-09: con un URL negli appunti `wl-paste` lo legge, un
+client Qt6 senza finestre legge stringa vuota. Quindi il testo lo legge
+`wl-paste`, che una superficie se la crea, e lo si spinge esplicito con
+`share.shareText`, che l'app Android copia negli appunti. Per lo stesso motivo
+e' morta anche la sincronizzazione automatica del plugin, che aspetta un
+segnale `changed` che non arriva mai.
+
 Si parla con `busctl --json=short`, non con gdbus: gdbus stampa GVariant, che
 va fra apici o fra virgolette a seconda di cosa c'e' dentro la stringa, e
 questo progetto ha gia' pagato quella lezione una volta (vedi unwrap in
@@ -46,11 +60,18 @@ import tools
 TIMEOUT = 5
 
 BUSCTL = tools.which("busctl")
+WLPASTE = tools.which("wl-paste")
 
 KDE = "org.kde.kdeconnect"
 KDE_DAEMON = "/modules/kdeconnect"
 KDE_DEVICE = "org.kde.kdeconnect.device"
 KDE_BATTERY = "org.kde.kdeconnect.device.battery"
+KDE_SHARE = "org.kde.kdeconnect.device.share"
+
+# I tipi coi quali si chiede il testo agli appunti, nell'ordine. Il primo e'
+# quello che offrono tutti; il secondo e' il nome X11 che resta da solo quando
+# a copiare e' stato un programma vecchio passato per Xwayland.
+CLIPBOARD_TYPES = ("text/plain", "UTF8_STRING")
 
 GS = "org.gnome.Shell.Extensions.GSConnect"
 GS_ROOT = "/org/gnome/Shell/Extensions/GSConnect"
@@ -274,13 +295,15 @@ def clipboard_capabilities(entry):
     if not (entry["paired"] and entry["reachable"]):
         return
 
-    if "kdeconnectd" in entry["known_to"]:
-        # L'oggetto del plugin esiste solo se il plugin e' caricato: se manca,
-        # `properties` torna vuoto e non c'e' niente a cui parlare.
-        loaded = properties(
-            KDE, f"{KDE_DAEMON}/devices/{entry['id']}/clipboard",
-            "org.kde.kdeconnect.device.clipboard")
-        entry["can_send"] = bool(loaded)
+    if "kdeconnectd" in entry["known_to"] and WLPASTE:
+        # Si chiede del plugin share, non di quello clipboard: l'invio passa da
+        # `shareText` con il testo che legge wl-paste, per la ragione scritta in
+        # cima al file. Senza wl-paste non c'e' modo di leggere gli appunti,
+        # quindi nemmeno di mandarli: meglio nessuna freccia che una freccia che
+        # al clic si scusa.
+        has = bus("call", KDE, f"{KDE_DAEMON}/devices/{entry['id']}",
+                  KDE_DEVICE, "hasPlugin", "s", "kdeconnect_share")
+        entry["can_send"] = bool(has and has[0])
 
     if "gsconnect" in entry["known_to"]:
         listed = bus("call", GS, f"{GS_ROOT}/Device/{entry['id']}",
@@ -302,6 +325,37 @@ def find_device(device_id):
     return None
 
 
+def clipboard_text():
+    """Il testo negli appunti di questa sessione, o il motivo per cui manca.
+
+    Letto da fuori con wl-paste e non chiesto al demone: la nota in cima al
+    file dice perche' kdeconnectd, da dentro la sessione, gli appunti non li
+    vede. Le immagini restano fuori di proposito — il plugin share saprebbe
+    mandare anche un file, ma qui si e' chiesto di mandare del testo, e una
+    clipboard che contiene un PNG e' un errore da dire, non da indovinare.
+    """
+    if not WLPASTE:
+        return None, "wl-paste non e' installato (pacchetto wl-clipboard)"
+
+    for kind in CLIPBOARD_TYPES:
+        try:
+            done = subprocess.run(
+                [WLPASTE, "--no-newline", "--type", kind],
+                capture_output=True,
+                text=True,
+                timeout=TIMEOUT,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "wl-paste non ha risposto in tempo"
+        except (OSError, subprocess.SubprocessError) as exc:
+            return None, f"wl-paste non eseguibile: {exc}"
+
+        if done.returncode == 0 and done.stdout:
+            return done.stdout, ""
+
+    return None, "gli appunti sono vuoti o non contengono testo"
+
+
 def send_clipboard(device_id):
     """La clipboard di questo PC finisce su quella del telefono."""
     device = find_device(device_id)
@@ -310,16 +364,27 @@ def send_clipboard(device_id):
     if not device["can_send"]:
         return {"ok": False, "error": "dispositivo non accoppiato o non raggiungibile"}
 
+    error = ""
+
     # kdeconnectd per primo quando lo conosce: e' il demone che tiene anche la
     # batteria, quindi e' quello che sicuramente sta parlando col telefono.
     if "kdeconnectd" in device["known_to"]:
+        text, why = clipboard_text()
+        if text is None:
+            # Non si ripiega su GSConnect: se gli appunti non hanno testo non ce
+            # l'hanno per nessuno dei due, e il motivo vero si perderebbe dietro
+            # un secondo errore.
+            return {"ok": False, "error": why}
+
         error = invoke(
-            "call", KDE, f"{KDE_DAEMON}/devices/{device_id}/clipboard",
-            "org.kde.kdeconnect.device.clipboard", "sendClipboard")
+            "call", KDE, f"{KDE_DAEMON}/devices/{device_id}/share",
+            KDE_SHARE, "shareText", "s", text)
         if not error:
             return {"ok": True, "action": "send", "device": device["name"],
-                    "via": "kdeconnectd"}
+                    "via": "kdeconnectd", "chars": len(text)}
 
+    # GSConnect gli appunti li legge da gnome-shell, cioe' dal compositor:
+    # `clipboardPush` da li' e' corretto e non ha bisogno di wl-paste.
     if "gsconnect" in device["known_to"]:
         error = invoke(
             "call", GS, f"{GS_ROOT}/Device/{device_id}", GS_ACTIONS,

@@ -16,3 +16,6 @@ home-assistant.json
 *.bak
 *.orig
 *~
+
+# Output di lavorazione di graphify (grafo di conoscenza)
+graphify-out/
