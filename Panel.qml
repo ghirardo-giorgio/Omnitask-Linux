@@ -14,7 +14,7 @@ Item {
     // Iniettate da omarchy-shell al caricamento del modulo. Vanno dichiarate
     // anche se non tutte servono: e' il contratto con cui la shell ci carica.
     property var bar
-    property string moduleName: "io.github.hal68000.dashboard"
+    property string moduleName: "io.github.ghirardo-giorgio.omnitask-linux"
     property var settings
 
     implicitWidth: dash.implicitWidth

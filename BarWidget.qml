@@ -13,7 +13,7 @@ Item {
 
     // Iniettate da omarchy-shell al caricamento del modulo.
     property var bar
-    property string moduleName: "io.github.hal68000.dashboard"
+    property string moduleName: "io.github.ghirardo-giorgio.omnitask-linux"
     property var settings
 
     // Sul lato lungo della barra il testo decide la larghezza; sul lato corto

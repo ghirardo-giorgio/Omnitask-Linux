@@ -220,7 +220,7 @@ if [[ $DO_LAUNCHER -eq 1 ]]; then
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Dashboard (Quickshell)
+Name=Omnitask-Linux
 GenericName=System Dashboard
 Comment=System and monitoring dashboard for Quickshell
 Exec=$LAUNCH_CMD
@@ -244,8 +244,8 @@ if [[ $DO_AUTOSTART -eq 1 ]]; then
         cat > "$AUTOSTART_FILE" <<EOF
 [Desktop Entry]
 Type=Application
-Name=Dashboard (Quickshell)
-Comment=Starts the Quickshell dashboard at login
+Name=Omnitask-Linux
+Comment=Starts the Omnitask-Linux dashboard at login
 Exec=$LAUNCH_CMD
 Terminal=false
 X-GNOME-Autostart-enabled=true
