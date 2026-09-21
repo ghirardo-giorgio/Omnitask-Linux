@@ -6,9 +6,19 @@ A fast, fully-configurable **system monitoring dashboard** built for [Quickshell
 
 **Tested on one machine.** Omnitask-Linux is written and tested on a single computer running **Fedora/Nobara** (GNOME on Wayland), with an NVIDIA GPU and Home Assistant in Docker. It is plain QML + Python and plausibly runs elsewhere, but the other install paths below (Arch, Omarchy plugin, wlroots compositors) are provided, not verified.
 
-![Dashboard](screenshot.png)
+![The main dashboard — three columns, the pet in the middle, the meter disc at work](screenshots/dashboard-main.png)
 
-> _Drop a capture of your dashboard as `screenshot.png` in the project root to fill this in._
+## Screenshots
+
+The secondary windows, opened from the Tools panel or from a panel's own buttons:
+
+| **Services** — user & system units, search and per-row favourites | **Processes** — filterable by owner, with per-process GPU, disk and network |
+| --- | --- |
+| ![Services window](screenshots/services.png) | ![Processes window](screenshots/processes.png) |
+| **Network** — per-process traffic and the world globe of the hosts | **Hardware** — every device with the driver the kernel bound to it |
+| ![Network window with the world globe](screenshots/network-globe.png) | ![Hardware window](screenshots/hardware.png) |
+| **Options** — layout, entities, language and disks, all live | |
+| ![Options window](screenshots/options.png) | |
 
 ## Features
 
