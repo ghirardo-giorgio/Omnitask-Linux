@@ -604,7 +604,7 @@ Only the key goes in a config file, `~/.config/quickshell/macrocam.json`; the ad
 **A phone that accepts the connection and then says nothing is not broken, it is frozen.** ColorOS puts processes in the freezer when the screen goes off — foreground service included — and from the outside that is indistinguishable from a network fault, because the port keeps accepting: accepting is the kernel's job, not the app's. It cost half an hour to find the first time, so `macrocam_web.py` now names it on any timeout. It is fixed once, by exempting the app:
 
 ```bash
-adb shell dumpsys deviceidle whitelist +com.oberon.macrocamweb
+adb shell dumpsys deviceidle whitelist +com.ghirardogiorgio.macrocam
 ```
 
 Measured on the OPG02: without the exemption every request with the screen off died of timeout; with it, `/api/state` answers in 50 ms while the phone is asleep.

@@ -42,7 +42,7 @@ schermo spento — servizio in primo piano compreso — e da fuori la differenza
 con un guasto di rete non si vede, perche' la porta continua ad accettare: ad
 accettare e' il kernel. Si sistema una volta sola, esentando l'app:
 
-    adb shell dumpsys deviceidle whitelist +com.oberon.macrocamweb
+    adb shell dumpsys deviceidle whitelist +com.ghirardogiorgio.macrocam
 
 Misurato sull'OPG02: senza esenzione, ogni richiesta a schermo spento moriva di
 timeout; con l'esenzione, `/api/state` risponde in cinquanta millisecondi a
@@ -72,7 +72,10 @@ CACHE = os.path.join(
     "macrocam-web.json",
 )
 
-PACKAGE = "com.oberon.macrocamweb"
+# L'app e' com.ghirardogiorgio.macrocam dal rilascio pubblico (era
+# com.oberon.macrocamweb): il nome serve a `token` per leggere le sue
+# preferenze via run-as, e al suggerimento della whitelist che FROZEN scrive.
+PACKAGE = "com.ghirardogiorgio.macrocam"
 DEFAULT_PORT = 8420
 
 # Tre timeout per tre domande diverse. Chiedere "ci sei?" a un indirizzo che

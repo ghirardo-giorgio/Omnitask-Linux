@@ -1,8 +1,8 @@
 pragma Singleton
 
 import QtQuick
-import QtMultimedia
 import Quickshell
+import Quickshell.Io
 
 // I quattro suoni della stanza del pet: il preavviso di un bonus, quello di un
 // malus, il tonfo a terra e la raccolta.
@@ -11,15 +11,17 @@ import Quickshell
 // qualche kilobyte l'una — invece di arrivare da un pacchetto scaricato: cosi'
 // non c'e' una licenza da portare dietro e suonano come il pet e' disegnato.
 //
-// 🔴 `SoundEffect` e non `MediaPlayer`: tiene il campione decodificato in
-// memoria e lo fa partire senza latenza, che e' l'unica cosa che conta per un
-// suono legato a un fotogramma — un MediaPlayer riapre la sorgente a ogni
-// play() e il tonfo arriverebbe dopo il rimbalzo. In cambio vuole WAV PCM, ed
-// e' il motivo per cui lo script genera WAV e non Ogg.
+// 🔴 `pw-play` e non `SoundEffect` (Qt Multimedia): il backend FFmpeg di
+// Qt Multimedia 6.11 ha QTBUG-143167 — a ogni suono il thread audio tocca un
+// QSocketNotifier dal thread sbagliato e Qt entra in un flood infinito di
+// warning (`Invalid socket ... disabling...`) che ha scritto 6 GB di log in
+// tmpfs (RAM) in 18 minuti, fino a swappare e congelare il desktop. Fino a
+// Qt 6.12 niente Qt Multimedia nella shell: i WAV partono da pw-play, che
+// parla diretto con PipeWire e non carica il backend incriminato.
 //
-// ⚠️ Le sorgenti passano da PluginPaths e non da Qt.resolvedUrl(): dentro
+// Le sorgenti passano da PluginPaths e non da Qt.resolvedUrl(): dentro
 // Quickshell i documenti si risolvono su uno schema suo (`qs:@/…`) che il
-// decoder audio non sa aprire. Stessa ragione, e stessa soluzione, del font in
+// player non sa aprire. Stessa ragione, e stessa soluzione, del font in
 // PetStyle.qml.
 Singleton {
     id: root
@@ -37,59 +39,67 @@ Singleton {
         return typeof v === "number" && isFinite(v) ? Math.max(0, Math.min(1, v)) : 0.5;
     }
 
-    // ---- Le voci -----------------------------------------------------------
+    // Un suono e un processo: pw-play non si riavvia mentre suona, quindi ogni
+    // voce ha il suo Process dedicato e `play()` lo fa ripartire — un suono
+    // interrotto al secondo colpo, non un processo che si accavalla.
     //
-    // Una per suono e caricate all'avvio, non una sola con la sorgente che
-    // cambia: cambiare `source` rimette lo stato a Loading, e un suono chiesto
-    // durante quel caricamento non parte affatto.
+    // Il volume passa sulla riga di comando (`--volume` 0-1) invece che dentro
+    // il comando: cosi' cambiare la preferenza non tocca il codice, e i Process
+    // restano dichiarativi con la command list ricostruita dal binding.
     function play(name: string) {
         if (!root.enabled)
             return;
 
         switch (name) {
         case "warnBonus":
-            warnBonus.play();
+            warnBonus.running = false;
+            warnBonus.command = sfxCommand("sfx/warn_bonus.wav", root.volume);
+            warnBonus.running = true;
             break;
         case "warnMalus":
-            warnMalus.play();
+            warnMalus.running = false;
+            warnMalus.command = sfxCommand("sfx/warn_malus.wav", root.volume);
+            warnMalus.running = true;
             break;
         case "land":
-            land.play();
+            // Il tonfo sta sotto gli altri: e' il piu' frequente dei quattro —
+            // uno per ogni oggetto, raccolto o no — e alla pari degli altri
+            // diventa il suono che si sente di piu' pur essendo quello che
+            // dice meno.
+            land.running = false;
+            land.command = sfxCommand("sfx/land.wav", root.volume * 0.7);
+            land.running = true;
             break;
         case "catch":
-            catchSfx.play();
+            catchSfx.running = false;
+            catchSfx.command = sfxCommand("sfx/catch.wav", root.volume);
+            catchSfx.running = true;
             break;
         }
     }
 
-    SoundEffect {
+    function sfxCommand(relPath: string, vol: real): var {
+        return [
+            "pw-play",
+            "--volume",
+            String(Math.max(0, Math.min(1, vol))),
+            "file://" + PluginPaths.of(relPath)
+        ];
+    }
+
+    Process {
         id: warnBonus
-
-        source: "file://" + PluginPaths.of("sfx/warn_bonus.wav")
-        volume: root.volume
     }
 
-    SoundEffect {
+    Process {
         id: warnMalus
-
-        source: "file://" + PluginPaths.of("sfx/warn_malus.wav")
-        volume: root.volume
     }
 
-    SoundEffect {
+    Process {
         id: land
-
-        source: "file://" + PluginPaths.of("sfx/land.wav")
-        // Il tonfo sta sotto gli altri: e' il piu' frequente dei quattro — uno
-        // per ogni oggetto, raccolto o no — e alla pari degli altri diventa il
-        // suono che si sente di piu' pur essendo quello che dice meno.
-        volume: root.volume * 0.7
     }
 
-    SoundEffect {
+    Process {
         id: catchSfx
-
-        source: "file://" + PluginPaths.of("sfx/catch.wav")
-        volume: root.volume
     }
 }

@@ -19,3 +19,7 @@ home-assistant.json
 
 # Output di lavorazione di graphify (grafo di conoscenza)
 graphify-out/
+
+# Node packages locali per il server MCP youtube-video-summarizer
+# (la config di .mcp.json punta a questo percorso; non va versionato)
+.mcp-tmp/

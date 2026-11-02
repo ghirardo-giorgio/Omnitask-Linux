@@ -1,7 +1,8 @@
 import QtQuick
 import QtQuick.Layouts
-// Process, per la lettura chiesta a mano: il timer di systemd fa la sua ogni
-// dieci minuti, ma chi guarda adesso non ha voglia di aspettarne nove.
+// Process, per il chime e per la lettura chiesta a mano: il timer di systemd
+// fa la sua ogni dieci minuti, ma chi guarda adesso non ha voglia di aspettarne
+// nove.
 import Quickshell.Io
 
 // Il pannello sta in panels/: senza `import ".."` si caricherebbe lo stesso,
@@ -34,11 +35,14 @@ ColumnLayout {
     // di configurazione (sezione "panelParams" di dashboard.json): qui
     // resta solo il default, che il pannello registra al primo avvio.
     // Le entita' sono quelle pubblicate da scripts/solar_meter.py; la
-    // capacita' e' quella del power bank collegato al tester.
+    // capacita' e' quella del power bank collegato al tester. `sound` e'
+    // l'interruttore del richiamo ai due cambi di posizione (vedi sotto),
+    // lo stesso nome che porta quello della stanza del pet.
     readonly property var defs: ({
             capacityMah: 10000,
             chargeEntity: "sensor.solare_usb_carica",
-            powerEntity: "sensor.solare_usb_potenza"
+            powerEntity: "sensor.solare_usb_potenza",
+            sound: true
         })
     // Capacita' della batteria in mAh: il pieno della barra.
     readonly property int capacityMah: Settings.panelParam("solar", "capacityMah", defs.capacityMah)
@@ -134,6 +138,62 @@ ColumnLayout {
             sud: "Sud",
             ovest: "Ovest"
         })[root.orientation] ?? ""
+
+    // --- il suono del cambio --------------------------------------------------
+    //
+    // Il richiamo di Windows 3.1 quando il pannello va girato: due volte al
+    // giorno, est → sud e sud → ovest. Non e' l'avviso di un guasto, e' il
+    // momento in cui chi e' alla scrivania puo' ancora alzarsi e girarlo
+    // davvero — un suono arrivato un'ora dopo non serve a niente.
+    //
+    // `win31.wav` e' la conversione di `win31.mp3`, che resta in `sfx/` come
+    // sorgente: pw-play riproduce WAV PCM non compressi. Si rifà con
+    //
+    //     ffmpeg -i sfx/win31.mp3 -c:a pcm_s16le -ar 44100 -ac 2 sfx/win31.wav
+    //
+    // Il volume resta 1.0, non meta' come nei suoni del pet: questo file e'
+    // gia' basso di suo (picco -11.9 dBFS), dimezzarlo vuol dire non sentirlo.
+    readonly property bool chimeOn: Settings.panelParam("solar", "sound", defs.sound) === true
+
+    // L'ultima posizione letta: serve a distinguere il cambio dal valore di
+    // partenza. All'avvio, o dopo un salvataggio della shell, la prima
+    // posizione che arriva non e' un passaggio — il pannello era gia' girato.
+    property string lastOrientation: ""
+
+    // La posizione vecchia si aggiorna sempre, anche col suono spento:
+    // riaccenderlo a meta' giornata non deve far suonare un passaggio gia'
+    // avvenuto.
+    onOrientationChanged: {
+        const from = root.lastOrientation;
+        root.lastOrientation = root.orientation;
+
+        if (!root.chimeOn)
+            return;
+
+        // Suona solo nei due giri che contano. Di notte l'orientamento si
+        // spegne (dayTime) e torna al mattino: "" → est e est → "" non sono
+        // un pannello da girare, e lo stesso vale quando Home Assistant non
+        // risponde — il passaggio si perde, non si rimanda a dopo.
+        if ((from === "est" && root.orientation === "sud")
+                || (from === "sud" && root.orientation === "ovest")) {
+            chime.command = [
+                "pw-play",
+                "--volume",
+                "1.0",
+                "file://" + PluginPaths.of("sfx/win31.wav")
+            ];
+            chime.start();
+        }
+    }
+
+    Process {
+        id: chime
+
+        // pw-play e non SoundEffect (Qt Multimedia): il backend FFmpeg di
+        // Qt Multimedia 6.11 ha QTBUG-143167 — vedi PetSfx.qml. Il Process
+        // resta fermo (command vuoto per difetto) finché un cambio di
+        // posizione non lo fa ripartire col WAV.
+    }
 
     // Gli orari dei cambi di oggi ({ toSouth, toWest } in millisecondi Unix):
     // li calcola SolarMath.js dalle coordinate di casa, le stesse con cui

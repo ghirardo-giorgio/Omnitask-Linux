@@ -816,6 +816,14 @@ def parse(text):
     # coppia da controllare e' gia' quella sbagliata in partenza.
     pair = re.search(r"(\d{1,3})\s*[^\d/]{0,2}[Cc]\s*/\s*(\d{1,3})\s*.?[Ff]", text)
 
+    # PP-OCR disegna la barra come un 7: "33C7091F" per 33 °C / 091 °F, dove
+    # ML Kit leggeva "33C/091F". Se la barra manca e un 7 la sostituisce, la
+    # si cerca lei: il giudice resta comunque la coerenza fra le due scale, e
+    # un 7 che fosse una cifra vera della Fahrenheit non supererebbe
+    # F = C · 9/5 + 32.
+    if not pair:
+        pair = re.search(r"(\d{1,3})\s*[^\d/]{0,2}[Cc]\s*7\s*(\d{2,3})\s*[Ff]", text)
+
     if pair:
         celsius, fahrenheit = float(pair.group(1)), float(pair.group(2))
 
