@@ -6,6 +6,9 @@ import QtQuick.Layouts
 // indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
 import ".."
 
+// Classifica RAM: da elenco a barre a torta. Le fette sono le prime sei
+// app; l'occupato che nessuna di loro nomina e' la fetta grigia "altre
+// app", il resto della capacita' la fetta verde "RAM libera".
 ColumnLayout {
 
     // L'id ferma il pannello nella configurazione salvata (le colonne
@@ -16,14 +19,24 @@ ColumnLayout {
     property string panelTitle: "Classifica RAM"
     spacing: 8
 
-    ProcList {
+    PieList {
         title: "TOP RAM"
-        accent: "#58a6ff"
         emptyText: I18n.t("in calcolo…")
-        entries: SystemStats.topRam.map(a => ({
+        freeLabel: I18n.t("RAM libera")
+        // sysmon ne manda sei per le torte, a prescindere da topCount:
+        // il taglio a sei qui e' la guardia se un domani la configurazione
+        // ne portasse di piu'.
+        entries: SystemStats.topRam.slice(0, 6).map(a => ({
                     name: a.name,
                     value: a.bytes,
-                    text: SystemStats.formatBytes(a.bytes, false)
+                    // Il carico CPU del processo accanto ai suoi byte: e'
+                    // il numero che sysmon aggiunge a ogni entry di topRam
+                    // (0 quando in quell'intervallo non ha toccato la CPU).
+                    text: `${SystemStats.formatBytes(a.bytes, false)} · CPU ${(a.cpu ?? 0).toFixed(0)}%`
                 }))
+        // "libera" qui e' MemAvailable: totale meno usato, lo stesso
+        // numero che il pannello RAM mette in percentuale.
+        used: SystemStats.mem.used
+        total: SystemStats.mem.total
     }
 }

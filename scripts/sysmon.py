@@ -30,6 +30,12 @@ import tools
 INTERVAL = 1.0
 TOP_COUNT = 3
 
+# Quante fette vogliono i grafici a torta della memoria: sei app
+# nominate e una di resto. Non segue --top perche' topCount e' una
+# preferenza sull'altezza delle classifiche in colonna; qui il numero
+# e' la forma del grafico, e vale anche quando topCount e' corto.
+TOP_MEM_SLICES = 6
+
 # La classifica RAM vive in un thread separato.
 RAM_INTERVAL = 10.0
 
@@ -1014,8 +1020,18 @@ def proc_cpu_times():
     return out
 
 
+# Le % CPU dell'ultimo campione, per nome di processo: la classifica RAM
+# (che gira in un thread suo, con un ritmo suo) le incolla accanto a ogni
+# app, cosi' la torta RAM risponde anche alla domanda "quanto spinge".
+# Aggiornata da top_cpu prima del taglio a `limit`, dove il dict esiste
+# comunque per tutti i processi.
+_cpu_pct = {}
+
+
 def top_cpu(prev, cur, total_delta, limit=3):
     """Processi che hanno consumato più CPU."""
+
+    global _cpu_pct
 
     if total_delta <= 0:
         return []
@@ -1041,6 +1057,15 @@ def top_cpu(prev, cur, total_delta, limit=3):
         key=lambda kv: kv[1],
         reverse=True,
     )[:limit]
+
+    # La classifica RAM legge qui. Con total_delta <= 0 si esce prima e il
+    # dict resta com'era: l'ultimo valore noto, meglio di uno 0 di
+    # comodo che cancellerebbe il carico a ogni campione perso.
+    _cpu_pct = {
+        name: round(ticks / total_delta * 100, 1)
+        for name, ticks in by_name.items()
+        if ticks / total_delta * 100 >= 0.1
+    }
 
     return [
         {
@@ -1181,10 +1206,22 @@ def ram_worker():
 
     while True:
         try:
-            _top_ram = compute_top_ram(
-                TOP_COUNT,
-                TOP_COUNT * 2,
-            )
+            # Ogni riga porta anche il suo carico CPU: la % del nome
+            # nell'ultimo campione di top_cpu, 0 quando in quell'intervallo
+            # il processo non ha usato la CPU (o non era ancora in
+            # classifica). Una riga RAM senza la sua CPU costringerebbe a
+            # aprire un secondo pannello per la stessa domanda.
+            _top_ram = [
+                {
+                    "name": p["name"],
+                    "bytes": p["bytes"],
+                    "cpu": _cpu_pct.get(p["name"], 0.0),
+                }
+                for p in compute_top_ram(
+                    TOP_MEM_SLICES,
+                    TOP_MEM_SLICES * 2,
+                )
+            ]
         except Exception:
             pass
 
@@ -4078,7 +4115,7 @@ def main():
 
             "topVram": top_vram(
                 gpu_list,
-                TOP_COUNT,
+                TOP_MEM_SLICES,
             ),
 
             "topRam": _top_ram,

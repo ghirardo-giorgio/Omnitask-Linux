@@ -6,6 +6,9 @@ import QtQuick.Layouts
 // indefiniti — vedi scripts/panels.py, che verifica la riga e lo dice.
 import ".."
 
+// Classifica VRAM: da elenco a barre a torta, la stessa forma del cugino
+// RAM. L'occupato che i processi nominati non coprono (driver, buffer) e'
+// la fetta grigia, il resto della capacita' la fetta verde "VRAM libera".
 ColumnLayout {
 
     // L'id ferma il pannello nella configurazione salvata (le colonne
@@ -16,14 +19,23 @@ ColumnLayout {
     property string panelTitle: "Classifica VRAM"
     spacing: 8
 
-    ProcList {
+    PieList {
         title: "TOP VRAM"
-        accent: "#a371f7"
         emptyText: I18n.t("nessun processo sulla GPU")
-        entries: SystemStats.topVram.map(a => ({
+        freeLabel: I18n.t("VRAM libera")
+        // Stesso taglio del cugino RAM: sei fette, a prescindere da
+        // topCount, che governa solo le classifiche CPU e GPU.
+        entries: SystemStats.topVram.slice(0, 6).map(a => ({
                     name: a.name,
                     value: a.mem,
-                    text: SystemStats.formatBytes(a.mem, false)
+                    // Il carico SM del processo accanto ai suoi byte: sysmon
+                    // lo manda gia' in ogni entry di topVram (campo `sm`,
+                    // 0 quando il processo non sta disegnando).
+                    text: `${SystemStats.formatBytes(a.mem, false)} · GPU ${(a.sm ?? 0).toFixed(0)}%`
                 }))
+        // Null di protezione: senza GPU la capacita' non si conosce, e la
+        // torta si accontenta di raccontare quello che sa.
+        used: SystemStats.gpu ? (SystemStats.gpu.memUsed ?? 0) : 0
+        total: SystemStats.gpu ? (SystemStats.gpu.memTotal ?? 0) : 0
     }
 }
