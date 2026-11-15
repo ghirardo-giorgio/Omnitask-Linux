@@ -198,6 +198,14 @@ Singleton {
     // riga a ogni ridisegno, e un array la farebbe cercare ogni volta.
     property var selected: ({})
     readonly property int selectedCount: Object.keys(root.selected).length
+    // gli stessi pid in ordine di scelta: la mappa perde la cronologia perche'
+    // le chiavi che sono numeri interi — e il pid lo e' — vengono enumerate in
+    // ordine di numero, non di inserimento. Serve a sapere quale processo e'
+    // stato checkato per ultimo: il dettaglio a destra mostra quello
+    property var selectedOrder: []
+    readonly property int lastSelected: root.selectedOrder.length > 0
+        ? root.selectedOrder[root.selectedOrder.length - 1]
+        : 0
 
     function isSelected(pid: int): bool {
         return root.selected[pid] !== undefined;
@@ -205,17 +213,25 @@ Singleton {
 
     function toggleSelected(process: var) {
         const next = Object.assign({}, root.selected);
-        if (next[process.pid] !== undefined)
+        const order = root.selectedOrder.slice();
+        if (next[process.pid] !== undefined) {
             delete next[process.pid];
-        else
+            const at = order.indexOf(process.pid);
+            if (at >= 0)
+                order.splice(at, 1);
+        } else {
             // si tiene anche il nome: quando l'azione partira', servira' a
             // verificare che dietro quel pid ci sia ancora lo stesso processo
             next[process.pid] = process.name;
+            order.push(process.pid);
+        }
         root.selected = next;
+        root.selectedOrder = order;
     }
 
     function clearSelected() {
         root.selected = ({});
+        root.selectedOrder = [];
     }
 
     // Seleziona in una volta tutti i processi che il filtro corrente lascia
@@ -223,9 +239,16 @@ Singleton {
     // di un filtro. I processi selezionati fuori dal filtro restano tali.
     function selectAll() {
         const next = Object.assign({}, root.selected);
-        for (const p of root.results)
+        const order = root.selectedOrder.slice();
+        for (const p of root.results) {
+            // uno gia' checkato non e' una scelta nuova: la sua posizione in
+            // cronologia deve restare, e resta solo se non lo si ri-mette
+            if (next[p.pid] === undefined)
+                order.push(p.pid);
             next[p.pid] = p.name;
+        }
         root.selected = next;
+        root.selectedOrder = order;
     }
 
     // Vero quando ogni risultato visibile e' selezionato: il pulsante che

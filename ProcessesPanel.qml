@@ -18,14 +18,34 @@ Rectangle {
     // comando dei processi lunghi si taglia comunque, e le misure restano
     // sempre incolonnate sulla destra.
     readonly property int nameWidth: Math.round(win.width * 0.40)
-    // La fascia a destra occupata dalle sei colonne numeriche, dal pulsante
-    // di chiusura, dal margine destro e dalle spaziature fra loro: i numeri
-    // sono quelli del RowLayout di ProcRow. Serve al riquadro di dettaglio,
-    // che deve stare fuori da qui.
-    readonly property int metricsWidth: 6 * win.metricWidth + 24 + 6 * 6 + 12
+    // larghezza della sezione di dettaglio fissa a destra
+    readonly property int dockWidth: 340
+    // la sezione esiste solo da questa larghezza in su: le sei colonne
+    // numeriche sono ~551 px di parte fissa, il nome del processo ne vuole
+    // almeno altri 200 per restare leggibile, e a tutto questo vanno
+    // sommati la sezione stessa, lo spazio fra le due parti e i margini.
+    // Sotto la soglia la sezione sparisce e la finestra torna tutta elenco:
+    // le colonne non entrerebbero, e la ✕ verrebbe tagliata
+    readonly property bool dockShown: win.width >= 1120
 
     // azione di massa in attesa del secondo clic di conferma
     property string confirmingAction: ""
+
+    // ultimo pid segnalato da una riga mentre il puntatore stava dentro la
+    // sezione di dettaglio: all'uscita quello e' il processo da descrivere
+    // (vedi il gate nel delegate e dockHover)
+    property int gatedHoverPid: -1
+    // la riga sotto il puntatore, da usare quando la sezione non e' impegnata
+    // con la selezione: vedi applyFocus
+    property int hoveredPid: 0
+
+    // Il dettaglio a destra mostra l'ultimo processo checkato quando c'e' una
+    // selezione; quando non ce n'e' una, la riga sotto il puntatore.
+    // `Processes.lastSelected` e' zero senza selezione, e lo zero in un `||`
+    // cede il passo all'hover: i due casi si distinguono da soli
+    function applyFocus() {
+        detailTimer.request(Processes.lastSelected || win.hoveredPid);
+    }
 
     // processo su cui e' aperto il menu del tasto destro, e dove aprirlo
     property var menuProcess: null
@@ -89,15 +109,27 @@ Rectangle {
         win.closeMenuLater();
     }
 
-    // Sei colonne numeriche invece di cinque: la stessa aria che aveva la
-    // colonna del processo a 840, senza strizzarla.
-    implicitWidth: 920
+    // default: elenco + sezione di dettaglio a destra. Le sei colonne
+    // numeriche stanno tutte nell'elenco, che a 1220 ha ancora aria per il
+    // nome dei processi lunghi; il minimo sotto cui la sezione si ripiega
+    // sta in dockShown
+    implicitWidth: 1220
     implicitHeight: 620
     color: "#0d1117"
 
     ColumnLayout {
-        anchors.fill: parent
-        anchors.margins: 12
+        anchors.left: parent.left
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.leftMargin: 12
+        anchors.topMargin: 12
+        anchors.bottomMargin: 12
+        // il bordo destro si fermava alla finestra: adesso si ferma alla
+        // sezione di dettaglio quando c'e', perche' le colonne numeriche
+        // non devono finire coperte. Il margine destro cambia insieme: 12
+        // quando la sezione non c'e', 8 px d'aria dal dock quando c'e'
+        anchors.right: win.dockShown ? dock.left : parent.right
+        anchors.rightMargin: win.dockShown ? 8 : 12
         spacing: 8
 
         // -------------------------------------------------------- ricerca
@@ -608,6 +640,12 @@ Rectangle {
                     list.rows = Processes.results;
                     settle.restart();
                 }
+
+                // un check o un toglimento sposta il dettaglio sulla nuova
+                // coda della cronologia: vedi applyFocus
+                function onLastSelectedChanged(): void {
+                    win.applyFocus();
+                }
             }
 
             // A intervallo zero: scatta appena la coda degli eventi si svuota,
@@ -631,7 +669,19 @@ Rectangle {
                 metricWidth: win.metricWidth
                 nameWidth: win.nameWidth
                 menuOpen: win.menuShown || win.menuJustClosed
-                onHovered: pid => detailTimer.request(pid)
+                onHovered: pid => {
+                    if (dockHover.hovered) {
+                        // il puntatore sta nella sezione di dettaglio: le
+                        // righe sotto hanno appena perso l'hover, e il pid
+                        // zero svuoterebbe la sezione proprio mentre si va
+                        // a cliccare un nodo dell'albero. Rimandiamo il
+                        // segnale a quando il puntatore ne esce
+                        win.gatedHoverPid = pid;
+                        return;
+                    }
+                    win.hoveredPid = pid;
+                    win.applyFocus();
+                }
                 onMenuRequested: (process, mx, my) => win.openMenu(process, mx, my)
             }
 
@@ -712,21 +762,81 @@ Rectangle {
         onTriggered: Processes.describe(detailTimer.pid)
     }
 
-    // --------------------------------------------------------- dettaglio
-    // Segue il puntatore restando dentro la finestra: un riquadro che esce dal
-    // bordo sarebbe illeggibile proprio sulle righe in fondo.
+    // ================================================== sezione di dettaglio
+    // I dettagli non stanno piu' in un riquadro che segue il puntatore:
+    // stanno qui, fermi a destra, con la catena dei processi padre sotto.
+    // Cliccare un nodo della catena fa quello che farebbe un clic sulla riga
+    // corrispondente nell'elenco: aggiunge quel processo alla selezione o lo
+    // toglie, cosi' si puo' colpire un antenato senza cercarlo fra trecento
+    // righe.
+    //
+    // Il contenuto segue la selezione: quando c'e' almeno un checkmark la
+    // sezione mostra l'ultimo processo checkato, perche' quello che si sta
+    // guardando e' lui; senza checkmark torna sulla riga sotto il puntatore
+    // (vedi applyFocus).
+    //
+    // Finche' il puntatore sta qui il contenuto resta fermo. Andare a cliccare un nodo vuol dire uscire dall'elenco, e
+    // quell'uscita porta con se' la perdita dell'hover della riga: il pid
+    // zero svuoterebbe la sezione sotto il dito, proprio mentre ci si
+    // avvicina. I segnali delle righe vengono quindi rimandati all'uscita
+    // (vedi gatedHoverPid e il gate nel delegate).
     Rectangle {
-        id: detailBox
+        id: dock
+
+        anchors.right: parent.right
+        anchors.top: parent.top
+        anchors.bottom: parent.bottom
+        anchors.margins: 12
+        width: win.dockWidth
+        visible: win.dockShown
+        clip: true
+        radius: 6
+        color: "#161b22"
+        border.width: 1
+        border.color: "#30363d"
 
         readonly property var info: Processes.detail
-        // i peer non stanno nei dettagli (che leggono /proc a richiesta) ma nel
-        // campione periodico: si ripescano dal processo con lo stesso pid
+        // i peer non stanno nei dettagli (che leggono /proc a richiesta) ma
+        // nel campione periodico: si ripescano dal processo con lo stesso pid
         readonly property var peers: {
-            if (!detailBox.info)
+            if (!dock.info)
                 return [];
-            const found = Processes.all.find(p => p.pid === detailBox.info.pid);
+            const found = Processes.all.find(p => p.pid === dock.info.pid);
             return found ? (found.peers ?? []) : [];
         }
+        // La catena dei padri, dalla radice fino alla riga guardata. Sale
+        // con gli ppid del campione intero, perche' il padre di un processo
+        // "miei" spesso e' di root e dal filtro corrente non passerebbe.
+        // Dieci salti al massimo: oltre, l'indentazione non sta nella
+        // sezione, e su Linux sopra systemd c'e' poco. Un padre morto nel
+        // frattempo ferma la catena, e ricostruirla a ogni campione la
+        // riattacca se il processo rinasce.
+        readonly property var chain: {
+            if (!dock.info)
+                return [];
+            const leaf = Processes.all.find(p => p.pid === dock.info.pid)
+                ?? { pid: dock.info.pid, name: dock.info.name, ppid: Number(dock.info.ppid) };
+            const su = [leaf];
+            const visti = new Set([leaf.pid]);
+            let nodo = leaf;
+            while (su.length < 10) {
+                const padre = Processes.all.find(p => p.pid === nodo.ppid);
+                if (!padre || padre.pid <= 0 || visti.has(padre.pid))
+                    break;
+                visti.add(padre.pid);
+                su.push(padre);
+                nodo = padre;
+            }
+            // la catena si ferma per il conteggio, non perche' non ci sono
+            // piu' padri: il segnaposto lo dice
+            if (su.length >= 10 && Processes.all.find(p => p.pid === nodo.ppid))
+                su.unshift({ truncated: true });
+            su.reverse();
+            return su;
+        }
+        // con il segnaposto in testa il primo processo vero sta un livello
+        // piu' in basso, e l'indentazione lo deve sapere
+        readonly property int depthShift: dock.chain.length > 0 && dock.chain[0].truncated ? 1 : 0
 
         function flag(iso: string): string {
             if (!iso || iso.length !== 2)
@@ -735,22 +845,23 @@ Rectangle {
             return String.fromCodePoint(base + iso.charCodeAt(0) - 65) + String.fromCodePoint(base + iso.charCodeAt(1) - 65);
         }
 
-        visible: detailBox.info !== null
-        // Sta dalla parte del processo e non sconfina mai sulle colonne
-        // numeriche: la ✕ e' all'estrema destra della riga, e un riquadro che
-        // ci finisce sopra la nasconde proprio mentre la si sta cercando.
-        width: Math.max(240, Math.min(360, win.width - win.metricsWidth - 20))
-        height: detailColumn.implicitHeight + 20
-        x: Math.max(8, Math.min(hoverPosition.x + 18, win.width - win.metricsWidth - width - 12))
-        y: Math.min(Math.max(8, hoverPosition.y - height / 2), win.height - height - 8)
-        radius: 8
-        color: "#0d1117"
-        border.width: 1
-        border.color: "#30363d"
+        // Gela il dettaglio mentre il puntatore sta nella sezione, e
+        // all'uscita consegna il pid che le righe hanno segnalato nel
+        // frattempo: vedi il gate nel delegate dell'elenco
+        HoverHandler {
+            id: dockHover
+
+            onHoveredChanged: {
+                if (!dockHover.hovered && win.gatedHoverPid >= 0) {
+                    const pid = win.gatedHoverPid;
+                    win.gatedHoverPid = -1;
+                    win.hoveredPid = pid;
+                    win.applyFocus();
+                }
+            }
+        }
 
         ColumnLayout {
-            id: detailColumn
-
             anchors.left: parent.left
             anchors.right: parent.right
             anchors.top: parent.top
@@ -759,46 +870,144 @@ Rectangle {
 
             Text {
                 Layout.fillWidth: true
+                color: "#8b949e"
+                font.pixelSize: 10
+                font.letterSpacing: 1
+                text: I18n.t("DETTAGLIO")
+            }
+
+            // la sezione sta sempre qui, anche quando non c'e' niente sotto
+            // il puntatore: un pannello che appare e sparisce insegna a
+            // ignorarlo
+            Text {
+                visible: dock.info === null
+                color: "#484f58"
+                font.pixelSize: 11
+                text: "—"
+            }
+
+            Text {
+                Layout.fillWidth: true
                 elide: Text.ElideRight
+                visible: dock.info !== null
                 color: "#c9d1d9"
                 font.pixelSize: 12
                 font.bold: true
-                text: detailBox.info ? `${detailBox.info.name} · ${detailBox.info.pid}` : ""
+                text: dock.info ? `${dock.info.name} · ${dock.info.pid}` : ""
             }
 
             Text {
                 Layout.fillWidth: true
                 Layout.bottomMargin: 4
+                visible: dock.info !== null
                 wrapMode: Text.Wrap
                 maximumLineCount: 4
                 elide: Text.ElideRight
                 color: "#8b949e"
                 font.pixelSize: 9
                 font.family: "monospace"
-                text: detailBox.info ? detailBox.info.cmdline : ""
+                text: dock.info ? dock.info.cmdline : ""
             }
 
             ProcInfo {
                 Layout.fillWidth: true
-                info: detailBox.info
+                info: dock.info
+            }
+
+            // ------------------------------------------------ catena dei padri
+            Text {
+                Layout.fillWidth: true
+                Layout.topMargin: 4
+                visible: dock.chain.length > 1
+                color: "#8b949e"
+                font.pixelSize: 10
+                font.letterSpacing: 1
+                text: I18n.t("PROCESSI PADRE")
+            }
+
+            Repeater {
+                model: dock.chain
+
+                Item {
+                    id: nodeItem
+
+                    required property var modelData
+                    required property int index
+
+                    Layout.fillWidth: true
+                    implicitHeight: nodeLine.implicitHeight
+
+                    // livello nella catena: il segnaposto non e' un livello
+                    readonly property int depth: index - dock.depthShift
+                    readonly property bool leaf: !nodeItem.modelData.truncated
+                        && index === dock.chain.length - 1
+                    readonly property bool chosen: !nodeItem.modelData.truncated
+                        && Processes.isSelected(nodeItem.modelData.pid)
+
+                    RowLayout {
+                        id: nodeLine
+
+                        anchors.fill: parent
+                        spacing: 4
+
+                        Text {
+                            Layout.fillWidth: true
+                            elide: Text.ElideMiddle
+                            // monospazio perche' l'indentazione deve
+                            // allinearsi: le guide contano come i nomi
+                            font.pixelSize: 10
+                            font.family: "monospace"
+                            font.bold: nodeItem.leaf || nodeItem.chosen
+                            // azzurro = la riga che si sta guardando; verde
+                            // con ✓ = nella selezione, un altro clic lo toglie
+                            color: nodeItem.modelData.truncated ? "#484f58"
+                                 : nodeItem.chosen ? "#3fb950"
+                                 : nodeItem.leaf ? "#58a6ff"
+                                 : nodeHot.hovered ? "#c9d1d9"
+                                 : "#8b949e"
+                            text: nodeItem.modelData.truncated
+                                  ? "…"
+                                  : (nodeItem.depth > 0
+                                     ? "│ ".repeat(nodeItem.depth - 1) + "└─ "
+                                     : "")
+                                    + (nodeItem.chosen ? "✓ " : "")
+                                    + nodeItem.modelData.name + " · " + nodeItem.modelData.pid
+                        }
+                    }
+
+                    HoverHandler {
+                        id: nodeHot
+
+                        enabled: !nodeItem.modelData.truncated
+                        cursorShape: Qt.PointingHandCursor
+                    }
+
+                    // TapHandler e non MouseArea perche' il click non c'e'
+                    // niente sotto che lo aspetti: l'elenco finisce prima
+                    // della sezione
+                    TapHandler {
+                        enabled: !nodeItem.modelData.truncated
+                        onTapped: Processes.toggleSelected(nodeItem.modelData)
+                    }
+                }
             }
 
             // --- con chi sta parlando ---
-            // Gli stessi indirizzi della finestra Rete: guardare un processo e
-            // chiedersi con chi comunica e' la stessa domanda, posta da
+            // Gli stessi indirizzi della finestra Rete: guardare un processo
+            // e chiedersi con chi comunica e' la stessa domanda, posta da
             // un'altra finestra.
             Text {
                 Layout.fillWidth: true
                 Layout.topMargin: 4
-                visible: detailBox.peers.length > 0
+                visible: dock.peers.length > 0
                 color: "#6e7681"
                 font.pixelSize: 9
                 font.letterSpacing: 1
-                text: I18n.tn(detailBox.peers.length, "1 CONNESSIONE", "%1 CONNESSIONI")
+                text: I18n.tn(dock.peers.length, "1 CONNESSIONE", "%1 CONNESSIONI")
             }
 
             Repeater {
-                model: detailBox.peers.slice(0, 6)
+                model: dock.peers.slice(0, 6)
 
                 RowLayout {
                     id: peerLine
@@ -810,7 +1019,7 @@ Rectangle {
 
                     Text {
                         font.pixelSize: 10
-                        text: detailBox.flag(peerLine.modelData.iso ?? "")
+                        text: dock.flag(peerLine.modelData.iso ?? "")
                     }
 
                     Text {
@@ -833,25 +1042,12 @@ Rectangle {
 
             Text {
                 Layout.fillWidth: true
-                visible: detailBox.peers.length > 6
+                visible: dock.peers.length > 6
                 color: "#484f58"
                 font.pixelSize: 9
-                text: I18n.t("e altri %1").arg(detailBox.peers.length - 6)
+                text: I18n.t("e altri %1").arg(dock.peers.length - 6)
             }
         }
-    }
-
-    // Posizione del puntatore dentro la finestra, per piazzare il riquadro.
-    // Non intercetta i click: le righe sotto restano cliccabili.
-    HoverHandler {
-        id: hoverHandler
-    }
-
-    QtObject {
-        id: hoverPosition
-
-        readonly property real x: hoverHandler.point.position.x
-        readonly property real y: hoverHandler.point.position.y
     }
 
     // ================================================= menu del tasto destro

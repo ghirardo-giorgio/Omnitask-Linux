@@ -494,7 +494,8 @@ def vpn_exit():
 
 
 def proc_stat(pid):
-    """(nome, jiffies di CPU usati, stato, nice) da /proc/PID/stat.
+    """(nome, jiffies di CPU usati, stato, nice, pid del padre) da
+    /proc/PID/stat.
 
     Il nome sta fra parentesi e puo' contenere spazi e parentesi a sua volta
     ("(Web Content)"): si taglia sull'ULTIMA graffa chiusa, non sulla prima,
@@ -502,17 +503,18 @@ def proc_stat(pid):
     data = read_text(f"{PROC}/{pid}/stat")
     end = data.rfind(")")
     if end < 0:
-        return "", 0, "", 0
+        return "", 0, "", 0, 0
     name = data[data.find("(") + 1:end]
     fields = data[end + 2:].split()
     try:
         # utime e stime: campi 14 e 15 di stat, qui 11 e 12 perche' i primi
         # tre (pid, comm, state) sono gia' fuori. Lo stato serve a far vedere
         # nell'elenco chi e' stato sospeso, il nice a dire con che priorita'
-        # sta girando.
-        return name, int(fields[11]) + int(fields[12]), fields[0], int(fields[16])
+        # sta girando, il ppid (campo 4 di stat, qui 1) a costruire l'albero
+        # dei padri nella sezione di dettaglio.
+        return name, int(fields[11]) + int(fields[12]), fields[0], int(fields[16]), int(fields[1])
     except (IndexError, ValueError):
-        return name, 0, fields[0] if fields else "", 0
+        return name, 0, fields[0] if fields else "", 0, 0
 
 
 def proc_rss(pid):
@@ -575,7 +577,7 @@ def snapshot():
         if not entry.isdigit():
             continue
         pid = int(entry)
-        name, ticks, state, nice = proc_stat(pid)
+        name, ticks, state, nice, ppid = proc_stat(pid)
         if not name:
             continue
         cmdline = proc_cmdline(pid)
@@ -587,6 +589,7 @@ def snapshot():
         user, owned = proc_owner(pid)
         out[pid] = {
             "pid": pid,
+            "ppid": ppid,
             "name": name,
             "cmdline": cmdline,
             "ticks": ticks,
@@ -879,6 +882,7 @@ def main():
                     peer.update(where)
             processes.append({
                 "pid": pid,
+                "ppid": entry["ppid"],
                 "name": entry["name"],
                 "cmdline": entry["cmdline"],
                 "user": entry["user"],

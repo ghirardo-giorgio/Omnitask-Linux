@@ -5,8 +5,10 @@ MemoryWindow {
 
     title: I18n.t("Processi")
     key: "processes"
-    // sei colonne numeriche: vedi ProcessesPanel per la misura
-    defaultWidth: 920
+    // elenco + sezione di dettaglio a destra: le misure stanno nel
+    // ProcessesPanel, e dockShown dice sotto quale larghezza la sezione
+    // si ripiega
+    defaultWidth: 1220
     defaultHeight: 620
     color: "#0d1117"
 
